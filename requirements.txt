@@ -1,0 +1,8 @@
+# Primary sentiment backend. If either of these two fails to install or
+# load at runtime, the pipeline automatically falls back to vaderSentiment
+# below - see src/sentiment_model.py.
+torch>=2.2
+transformers>=4.40
+
+# Offline lexicon fallback - no model download, pure Python.
+vaderSentiment>=3.3.2
