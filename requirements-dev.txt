@@ -1,0 +1,4 @@
+# Test-only. Not needed to run the pipeline itself (see requirements.txt),
+# only to run `python -m unittest discover -s tests`.
+-r requirements.txt
+moto[sqs,s3,dynamodb]>=5.0
