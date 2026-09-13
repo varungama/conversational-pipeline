@@ -1,33 +1,35 @@
-"""Entry point: score every conversation in an input directory and write
-durable JSON results.
-
-Usage:
-    python run.py --input data/conversations --output results
-
-First run downloads the sentiment model (~256MB) and caches it; later
-runs are offline. Falls back to VADER on download failure - see
-src/sentiment_model.py.
-"""
+"""Score every conversation in an input directory with a sentiment model and write durable JSON results, via a local file-based queue or AWS (SQS + S3 + DynamoDB)."""
 
 import argparse
 import json
 import logging
+import multiprocessing as mp
 import pathlib
+import time
 from datetime import datetime, timezone
 
+from src.conversation import parse_timestamp
+from src.metrics import DEFAULT_WEIGHTING, WEIGHTING_CHOICES
 from src.queue_store import FileQueue
-from src.sentiment_model import SentimentScorer
+from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer
 from src.worker import Worker
 
 logger = logging.getLogger(__name__)
 
 
-def configure_logging(log_dir: pathlib.Path) -> pathlib.Path:
-    """Logs to console and to a file under log_dir named by UTC start time,
-    so concurrent/repeated runs never overwrite each other's history."""
+def configure_logging(log_dir: pathlib.Path, suffix: str = "") -> pathlib.Path:
+    """Logs to both the console and a timestamped file under log_dir.
+
+    One file per run, named by the UTC time the run started - so logs
+    survive after the terminal is closed, and two runs (or two workers
+    started at different times) never overwrite each other's history.
+    `suffix` (e.g. "_worker0") keeps concurrent worker *processes* from
+    trying to share one log file, which - unlike the result ledger - has no
+    claim mechanism protecting it.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = log_dir / f"pipeline_{started_at}.log"
+    log_path = log_dir / f"pipeline_{started_at}{suffix}.log"
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -45,24 +47,33 @@ def configure_logging(log_dir: pathlib.Path) -> pathlib.Path:
     return log_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", default="data/conversations",
-                         help="Directory of conversation JSON files to score")
-    parser.add_argument("--work-dir", default="queue",
-                         help="Where the durable queue directories live")
-    parser.add_argument("--output", default="results",
-                         help="Where scored results are written")
-    parser.add_argument("--log-dir", default="logs",
-                        help="Where per-run log files are written (one timestamped file per run)")
-    args = parser.parse_args()
+def _run_one_worker_process(worker_index, work_dir_str, output_dir_str, scored_at, model_key,
+                             weighting, log_dir_str, result_conn):
+    """Entry point for one `--workers` child process. Must stay a
+    module-level function (not a closure/lambda) because Windows'
+    multiprocessing "spawn" start method re-imports this module in the
+    child and pickles the target by reference, not by value.
+    """
+    configure_logging(pathlib.Path(log_dir_str), suffix=f"_worker{worker_index}")
+    try:
+        queue = FileQueue(pathlib.Path(work_dir_str))
+        logger.info("[worker %d] Loading sentiment model %s...", worker_index, model_key)
+        scorer = SentimentScorer(model_key=model_key)
+        logger.info("[worker %d] Using scoring backend: %s (%s @ %s)", worker_index,
+                    scorer.backend_name, scorer.model_name, scorer.model_revision)
+        worker = Worker(queue, pathlib.Path(output_dir_str), scorer, scored_at=scored_at, weighting=weighting)
+        summary = worker.run_once()
+        logger.info("[worker %d] Done: %s", worker_index, json.dumps(summary))
+        result_conn.send(summary)
+    finally:
+        result_conn.close()
 
-    log_path = configure_logging(pathlib.Path(args.log_dir))
-    logger.info("Logging to %s", log_path)
 
+def run_local(args):
     input_dir = pathlib.Path(args.input)
     work_dir = pathlib.Path(args.work_dir)
     output_dir = pathlib.Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     queue = FileQueue(work_dir)
     enqueued = 0
@@ -71,12 +82,40 @@ def main():
         enqueued += 1
     logger.info("Enqueued %d conversation file(s) from %s", enqueued, input_dir)
 
-    logger.info("Loading sentiment model (downloads ~256MB on first run if not already cached)...")
-    scorer = SentimentScorer()
-    logger.info("Using backend: %s (%s @ %s)", scorer.backend_name, scorer.model_name, scorer.model_revision)
+    if args.workers <= 1:
+        logger.info("Loading sentiment model %s (downloads on first run if not already cached)...",
+                     args.model)
+        scorer = SentimentScorer(model_key=args.model)
+        logger.info("Using scoring backend: %s (%s @ %s)",
+                    scorer.backend_name, scorer.model_name, scorer.model_revision)
 
-    worker = Worker(queue, output_dir, scorer)
-    summary = worker.run_once()
+        worker = Worker(queue, output_dir, scorer, scored_at=args.scored_at, weighting=args.weighting)
+        summary = worker.run_once()
+    else:
+        logger.info("Starting %d worker processes against %s (model=%s, weighting=%s)",
+                     args.workers, work_dir, args.model, args.weighting)
+        processes = []
+        parent_conns = []
+        for worker_index in range(args.workers):
+            parent_conn, child_conn = mp.Pipe(duplex=False)
+            process = mp.Process(
+                target=_run_one_worker_process,
+                args=(worker_index, str(work_dir), str(output_dir), args.scored_at, args.model,
+                      args.weighting, args.log_dir, child_conn),
+            )
+            process.start()
+            child_conn.close()  # the child's copy is enough; close the parent's duplicate
+            processes.append(process)
+            parent_conns.append(parent_conn)
+
+        summary = {"processed": 0, "skipped_duplicate": 0, "dead_lettered": 0}
+        for worker_index, (process, conn) in enumerate(zip(processes, parent_conns)):
+            worker_summary = conn.recv()
+            conn.close()
+            process.join()
+            for key, count in worker_summary.items():
+                summary[key] = summary.get(key, 0) + count
+            logger.info("worker %d exited with code %s", worker_index, process.exitcode)
 
     combined = []
     for result_file in sorted(output_dir.glob("*.json")):
@@ -98,9 +137,130 @@ def main():
         json.dumps(dead_letters, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
-    logger.info("%s", json.dumps(summary, indent=2))
+    logger.info("Run summary: %s", json.dumps(summary))
     logger.info("Wrote %d scored conversation(s) to %s", len(combined), output_dir / "results.json")
     logger.info("Wrote %d dead-lettered conversation(s) to %s", len(dead_letters), output_dir / "errors.json")
+
+
+def run_aws(args):
+    from src.aws.bootstrap import ensure_infrastructure
+    from src.aws.clients import AwsClients
+    from src.aws.config import AwsConfig
+    from src.aws.dynamo_ledger import DynamoResultIndex
+    from src.aws.s3_store import S3ConversationStore, S3ResultStore
+    from src.aws.sqs_queue import SqsQueue
+    from src.aws.worker import AwsWorker
+
+    input_dir = pathlib.Path(args.input)
+    output_dir = pathlib.Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    config = AwsConfig()
+    logger.info("Connecting to %s (%s)...", config.endpoint_url or "real AWS", config.region)
+    clients = AwsClients(config)
+    infra = ensure_infrastructure(clients, config)
+    logger.info("Infrastructure ready: queue=%s, dlq=%s, buckets=%s/%s, table=%s",
+                config.queue_name, config.dead_letter_queue_name,
+                config.conversations_bucket, config.results_bucket, config.ledger_table_name)
+
+    conversations = S3ConversationStore(clients, config.conversations_bucket)
+    results_store = S3ResultStore(clients, config.results_bucket)
+    ledger = DynamoResultIndex(clients, config.ledger_table_name)
+    queue = SqsQueue(clients, infra["queue_url"], infra["dlq_url"])
+
+    enqueued = 0
+    for source_file in sorted(input_dir.glob("*.json")):
+        raw_doc = json.loads(source_file.read_text(encoding="utf-8"))
+        tenant_id = raw_doc.get("tenant_id") if isinstance(raw_doc, dict) else None
+        conversation_id = raw_doc.get("conversation_id") if isinstance(raw_doc, dict) else None
+        if not tenant_id or not conversation_id:
+            # Cannot even form an S3 key without these - upload it under a
+            # synthetic key so it still reaches the worker and gets a
+            # proper dead-letter reason via the normal validation path.
+            tenant_id, conversation_id = "unknown", source_file.stem
+        conversations.put(tenant_id, conversation_id, raw_doc)
+        queue.enqueue(tenant_id, conversation_id)
+        enqueued += 1
+    logger.info("Enqueued %d conversation file(s) from %s", enqueued, input_dir)
+
+    logger.info("Loading sentiment model %s (downloads on first run if not already cached)...", args.model)
+    scorer = SentimentScorer(model_key=args.model)
+    logger.info("Using scoring backend: %s (%s @ %s)",
+                scorer.backend_name, scorer.model_name, scorer.model_revision)
+
+    worker = AwsWorker(queue, conversations, results_store, ledger, scorer, scored_at=args.scored_at,
+                        weighting=args.weighting)
+
+    summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0}
+
+    idle_passes = 0
+    deadline = time.monotonic() + args.aws_drain_timeout
+    while time.monotonic() < deadline:
+        batch = worker.run_once()
+        summary["processed"] += batch["processed"]
+        summary["skipped_duplicate"] += batch["skipped_duplicate"]
+        summary["retry_attempts"] += batch["left_for_retry"]
+        if sum(batch.values()) == 0:
+            idle_passes += 1
+            if idle_passes >= 3 and queue.approximate_depth() == 0:
+                break
+            time.sleep(config.visibility_timeout_seconds / 2 + 0.5)
+        else:
+            idle_passes = 0
+
+    dead_letters = worker.drain_dead_letters()
+
+    combined = results_store.list_all()
+    (output_dir / "results.json").write_text(
+        json.dumps(combined, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (output_dir / "errors.json").write_text(
+        json.dumps(dead_letters, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+    logger.info("Run summary: %s", json.dumps(summary))
+    logger.info("Wrote %d scored conversation(s) to %s", len(combined), output_dir / "results.json")
+    logger.info("Wrote %d dead-lettered conversation(s) to %s", len(dead_letters), output_dir / "errors.json")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=["local", "aws"], default="local",
+                         help="'local' (default, file-based queue) or 'aws' (SQS + S3 + DynamoDB via LocalStack).")
+    parser.add_argument("--input", default="data/conversations",
+                         help="Directory of conversation JSON files to score.")
+    parser.add_argument("--work-dir", default="queue",
+                         help="[local backend only] Where the durable queue directories live.")
+    parser.add_argument("--output", default="results",
+                         help="Where scored results are written.")
+    parser.add_argument("--model", choices=sorted(MODEL_REGISTRY), default=DEFAULT_MODEL_KEY,
+                         help=f"Transformer backend to score turns with (default: {DEFAULT_MODEL_KEY}); see src/sentiment_model.py's MODEL_REGISTRY.")
+    parser.add_argument("--workers", type=int, default=1,
+                         help="[local backend only] Number of worker processes to run against the same --work-dir.")
+    parser.add_argument("--weighting", choices=WEIGHTING_CHOICES, default=DEFAULT_WEIGHTING,
+                         help=f"How overall_sentiment averages per-turn scores (default: {DEFAULT_WEIGHTING}); see src/metrics.py.")
+    parser.add_argument("--aws-drain-timeout", type=float, default=60.0,
+                         help="[aws backend only] Max seconds to keep draining the queue before giving up.")
+    parser.add_argument("--log-dir", default="logs",
+                         help="Where per-run log files are written.")
+    parser.add_argument("--scored-at", default="2026-03-02T10:00:00Z", metavar="YYYY-MM-DDTHH:MM:SSZ",
+                         help="Timestamp stamped on every output record's scored_at field (default: fixed, for reproducible runs).")
+    args = parser.parse_args()
+
+    if parse_timestamp(args.scored_at) is None:
+        parser.error(f"--scored-at must look like 2026-03-02T10:00:00Z, got {args.scored_at!r}")
+    if args.workers < 1:
+        parser.error(f"--workers must be at least 1, got {args.workers}")
+    if args.workers > 1 and args.backend != "local":
+        parser.error("--workers > 1 is only meaningful for --backend local.")
+
+    log_path = configure_logging(pathlib.Path(args.log_dir))
+    logger.info("Logging to %s", log_path)
+
+    if args.backend == "aws":
+        run_aws(args)
+    else:
+        run_local(args)
 
 
 if __name__ == "__main__":
