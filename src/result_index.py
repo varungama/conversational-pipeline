@@ -1,29 +1,52 @@
-"""A tiny durable ledger of which conversations have already been scored.
-
-Keyed by "tenant_id::conversation_id", not filename, so the same
-conversation delivered under two filenames (e.g. acme__c-000002.json and
-its .duplicate.json twin) is only scored once - first copy wins.
-
-Backed by one JSON file, read at startup and rewritten on every add. At
-real scale this would be a unique constraint in whatever DB stores
-results instead of a hand-rolled read/rewrite.
-"""
+"""A tiny durable, lock-protected JSON ledger, keyed by "tenant_id::conversation_id", that lets `try_claim` give
+exactly one worker process the right to record a given conversation's result."""
 
 import json
+import os
 import pathlib
+import time
+from contextlib import contextmanager
 
 
 class ResultIndex:
     def __init__(self, path: pathlib.Path):
         self.path = path
-        if self.path.exists():
-            self._seen = json.loads(self.path.read_text(encoding="utf-8"))
-        else:
-            self._seen = {}
+        self.lock_path = path.with_name(path.name + ".lock")
+        if not self.path.exists():
+            self._atomic_write({})
 
     def has(self, key: str) -> bool:
-        return key in self._seen
+        return key in self._read()
 
-    def add(self, key: str, result_filename: str):
-        self._seen[key] = result_filename
-        self.path.write_text(json.dumps(self._seen, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    def try_claim(self, key: str, result_filename: str) -> bool:
+        """Atomically checks-and-inserts `key`, returning True iff this call is the one that claimed it."""
+        with self._locked():
+            seen = self._read()
+            if key in seen:
+                return False
+            seen[key] = result_filename
+            self._atomic_write(seen)
+            return True
+
+    def _read(self) -> dict:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _atomic_write(self, seen: dict):
+        # Write-then-rename so a concurrent reader only ever sees a complete old or new file, never a half-written one.
+        tmp_path = self.path.with_name(self.path.name + f".tmp{os.getpid()}")
+        tmp_path.write_text(json.dumps(seen, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp_path, self.path)
+
+    @contextmanager
+    def _locked(self):
+        while True:
+            try:
+                fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except FileExistsError:
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            os.remove(self.lock_path)

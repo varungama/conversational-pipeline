@@ -1,17 +1,5 @@
-"""The two conversation-level metrics, computed over customer turns with
-scoreable text only (empty/whitespace text is excluded, not treated as
-neutral).
-
-overall_sentiment: plain mean of signed per-turn scores - equal weighting,
-no recency bias.
-
-sentiment_trajectory: (last - first) / 2 in chronological order. Scores
-are bounded to [-1, 1], so dividing by 2 keeps the delta bounded too,
-regardless of conversation length - only the endpoints matter.
-
-Both return None (not 0.0) when undefined, since "no data" and "measured
-zero" are different facts.
-"""
+"""Conversation-level metrics: overall_sentiment (the equal- or confidence-weighted mean of signed per-turn scores) and sentiment_trajectory
+((last - first customer score) / 2), each None when there aren't enough scoreable turns to define it."""
 
 NEUTRAL_THRESHOLD = 0.2  # a signed score inside [-threshold, threshold] reads as neutral / flat
 
@@ -32,29 +20,38 @@ def trend_label(delta, neutral_threshold=NEUTRAL_THRESHOLD):
     return "flat"
 
 
-def compute_overall_sentiment(customer_scores, neutral_threshold=NEUTRAL_THRESHOLD):
-    """customer_scores: list of (signed_score, confidence) tuples for
-    scoreable customer turns, in any order. Returns None if the list is empty."""
+WEIGHTING_CHOICES = ("equal", "confidence")
+DEFAULT_WEIGHTING = "equal"
+
+
+def compute_overall_sentiment(customer_scores, neutral_threshold=NEUTRAL_THRESHOLD, weighting=DEFAULT_WEIGHTING):
+    """Returns the equal- or confidence-weighted mean (per `weighting`) of customer_scores, a list of (signed_score, confidence) tuples, or None if empty."""
+    if weighting not in WEIGHTING_CHOICES:
+        raise ValueError(f"Unknown weighting {weighting!r}. Choose one of {WEIGHTING_CHOICES}.")
     if not customer_scores:
         return None
 
     scores = [score for score, _ in customer_scores]
     confidences = [confidence for _, confidence in customer_scores]
-    mean_score = sum(scores) / len(scores)
-    mean_confidence = sum(confidences) / len(confidences)
+    total_confidence = sum(confidences)
+    mean_confidence = total_confidence / len(confidences)
+
+    if weighting == "confidence" and total_confidence > 0:
+        mean_score = sum(score * confidence for score, confidence in customer_scores) / total_confidence
+    else:
+        mean_score = sum(scores) / len(scores)
 
     return {
         "label": sentiment_label(mean_score, neutral_threshold),
         "score": round(mean_score, 4),
         "confidence": round(mean_confidence, 4),
         "n_turns": len(scores),
+        "weighting": weighting,
     }
 
 
 def compute_sentiment_trajectory(ordered_customer_scores, neutral_threshold=NEUTRAL_THRESHOLD):
-    """ordered_customer_scores: signed scores for scoreable customer turns,
-    already sorted chronologically. Returns None with fewer than 2 turns -
-    a single point has no direction to report."""
+    """Returns the labeled sentiment shift across ordered_customer_scores (chronologically sorted signed scores), or None with fewer than 2 turns."""
     if len(ordered_customer_scores) < 2:
         return None
 
