@@ -1,0 +1,14 @@
+# LocalStack container emulating SQS/S3/DynamoDB: docker compose up -d, then python run.py --backend aws.
+services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs,s3,dynamodb
+      - DEFAULT_REGION=us-east-1
+    volumes:
+      - "localstack-data:/var/lib/localstack"
+
+volumes:
+  localstack-data:
