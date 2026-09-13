@@ -1,9 +1,10 @@
 """Parsing and validation for a single conversation record.
 
-Whole-record malformation (missing/non-list `turns`) rejects the entire
-record to the dead-letter output. Turn-level malformation (bad role, type,
-or missing field on one turn) skips just that turn, recording why, while
-the rest of the conversation is still scored.
+Two kinds of malformation, handled differently:
+  - Whole-record (`turns` missing or not a list): reject the whole record
+    to dead-letter, rather than guess a result.
+  - Turn-level (one bad turn in an otherwise fine list): skip just that
+    turn with a reason, keep scoring the rest.
 """
 
 from datetime import datetime
@@ -26,9 +27,7 @@ def parse_timestamp(value):
 
 
 def validate_turn(raw_turn, index):
-    """Checks one turn object against the required shape.
-
-    Returns a dict describing the outcome:
+    """Checks one turn object against the required shape. Returns:
       {"status": "ok", "index", "seq", "role", "ts", "parsed_ts", "text", "has_content"}
       {"status": "skipped", "index", "reason"}
     """
@@ -40,7 +39,7 @@ def validate_turn(raw_turn, index):
     ts_raw = raw_turn.get("ts")
     text = raw_turn.get("text")
 
-    # bool is a subclass of int in Python, so it is explicitly excluded here.
+    # bool is a subclass of int, so excluded explicitly
     if not isinstance(seq, int) or isinstance(seq, bool):
         return {"status": "skipped", "index": index, "reason": "seq_missing_or_wrong_type"}
 
@@ -68,11 +67,8 @@ def validate_turn(raw_turn, index):
 
 def load_conversation(raw_doc):
     """Validates the whole-record shape and returns one result per turn.
-
-    Raises ConversationRejected if the record cannot be processed at all
-    (missing or wrongly-typed `turns`). Individual bad turns inside a valid
-    `turns` list are reported as skipped, not raised.
-    """
+    Raises ConversationRejected if `turns` is missing/wrongly-typed;
+    individual bad turns are reported as skipped, not raised."""
     if not isinstance(raw_doc, dict):
         raise ConversationRejected("record_not_an_object")
 

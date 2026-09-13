@@ -1,17 +1,17 @@
-"""A minimal, durable, file-based work queue with four directories:
+"""A minimal, durable, file-based work queue.
 
     pending/      work waiting to be picked up
     processing/   claimed by a worker, in flight
     done/         finished successfully, kept as a receipt
-    dead_letter/  could not be processed, with a reason file alongside
+    dead_letter/  could not be processed at all, with a reason file alongside
 
-Claiming is a single `os.rename` into processing/, atomic on the same
-filesystem: exactly one worker wins a race, the other gets OSError and
-moves on. No lock server needed at this scale.
+Claiming a file is one `os.rename` into processing/ - atomic on the same
+filesystem, so two workers racing for a file leave exactly one winner. No
+lock server needed at this scale.
 
-Known gap (see NOTES.md): unlike a real queue with visibility timeouts, a
-worker that crashes mid-claim leaves its file stuck in processing/ until
-a human or sweeper looks.
+Deliberately cut: no visibility timeout. A real queue (SQS) redelivers a
+crashed worker's claimed message automatically; a file left in processing/
+here just sits until a human or sweeper looks (see NOTES.md).
 """
 
 import os
@@ -30,8 +30,8 @@ class FileQueue:
             directory.mkdir(parents=True, exist_ok=True)
 
     def enqueue(self, source_path: pathlib.Path) -> pathlib.Path:
-        """Copies a conversation file into pending/. The source file is left
-        untouched, so re-running against the same input directory is safe."""
+        """Copies a conversation file into pending/, leaving the source
+        untouched so re-running against the same input is safe."""
         target = self.pending / source_path.name
         shutil.copy2(source_path, target)
         return target
