@@ -148,8 +148,8 @@ Measured on one CPU core, no GPU, single-conversation-set benchmark.
 | Throughput | 77 turns/sec | 16.4 turns/sec (4.7x slower) |
 | Backfill (500M convos, 7-day window) | ~129 cores | ~605 cores |
 | Steady state (2M/day) | ~3.6 cores | ~16.9 cores |
-| Cost / million conversations, on-demand | ~$1.73 | ~$8.13 |
-| Cost / million conversations, spot | ~$0.52–0.69 | ~$2.45–3.25 |
+| Cost / million conversations, on-demand | ~\$1.73 | ~\$8.13 |
+| Cost / million conversations, spot | ~\$0.52–0.69 | ~\$2.45–3.25 |
 
 - Bottleneck is model inference, not I/O. A forward pass is ~13ms (distilbert) / ~61ms (roberta).
 - Batching (`batch_size=32`) measured *slower* than unbatched, on distilbert. Padding waste from mixed turn lengths. Not re-tested on roberta.
@@ -160,6 +160,31 @@ Measured on one CPU core, no GPU, single-conversation-set benchmark.
 2. The idempotency ledger. It rewrites the whole seen-set on every write. `O(n)`. This is the real bottleneck, before fleet size is.
 
 **Scaling levers, by effort:** more workers (done) → length-bucketed batching (unverified) → ONNX + INT8 quantization (estimated 2–4x, not measured) → temporary GPU for the backfill only.
+
+**Cost, as \$/month and \$/backfill (assumptions stated, not measured):**
+
+Pricing: Fargate on-demand \$0.04048/vCPU-hr. SQS \$0.40/million requests, 1M free. DynamoDB on-demand write \$1.25/million WRU. (The Fargate rate is reverse-solved from the cost/million row above, not a new assumption.)
+
+Steady state, 2M/day = 60M conversations/month:
+
+| | distilbert | roberta (default) |
+| --- | --- | --- |
+| Compute (3.6 / 16.9 cores, 24/7) | ~\$105/mo | ~\$493/mo |
+| SQS (~2.1 req/convo: send + batched receive + delete) | ~\$48/mo | ~\$48/mo |
+| DynamoDB (60M conditional-put writes) | ~\$75/mo | ~\$75/mo |
+| **Total** | **~\$228/mo** | **~\$616/mo** |
+
+- roberta is the shipped default: ~\$616/mo, not \$300-400/mo. That range is an 8-vCPU flat assumption — closer to distilbert's 3.6 cores than roberta's measured 16.9.
+- S3 (transcript + result writes, growing storage) not in the table — order of \$20-30/mo, small next to compute either way.
+
+Backfill, 500M conversations, one-time (cost/million × 500):
+
+| | distilbert | roberta (default) |
+| --- | --- | --- |
+| On-demand | ~\$865 | ~\$4,065 |
+| Spot | ~\$260-345 | ~\$1,225-1,625 |
+
+- roberta's on-demand backfill (~\$4,065) is ≈6.6 months of its own steady-state bill, not a separate order of magnitude. It's a one-time bump worth sizing, not the number to fear.
 
 ---
 
@@ -191,10 +216,49 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 | `results/*.json` | S3 |
 | `results/index.json` | DynamoDB, conditional write |
 
+```text
+                    ┌───────────────────────┐
+  conversation ───▶ │  S3: conversations    │  key = "{tenant_id}/{conversation_id}.json"
+    completed       │       bucket           │  (mirrors data/conversations/ on local)
+                    └───────────┬────────────┘
+                                │ pointer only: {tenant_id, conversation_id} —
+                                │ never the transcript (SQS caps messages at
+                                │ 256KB; see src/aws/sqs_queue.py)
+                                ▼
+                    ┌─────────────────┐  after maxReceiveCount   ┌────────────┐
+                    │  SQS standard   │─────────────────────────▶│  SQS DLQ   │
+                    │     queue       │      (redrive policy)    │            │
+                    └────────┬────────┘                          └─────┬──────┘
+                             │                                         │
+        ECS autoscaling on ApproximateNumberOfMessagesVisible          ▼
+                             │                              CloudWatch alarm → SNS
+                             ▼                              → on-call (design only,
+              ┌───────────────────────────┐                  not wired yet — §9)
+              │  ECS on Fargate: worker    │  model loaded ONCE per task, then
+              │  task (min 1-2 warm, no    │  loops: receive → fetch from S3 →
+              │  per-invocation reload     │  score → try_claim → put → delete
+              │  like Lambda would need)   │
+              └──────────────┬─────────────┘
+                              │
+                 ┌────────────┴─────────────┐
+                 ▼                          ▼
+      ┌────────────────────────┐   ┌───────────────────────┐
+      │       DynamoDB         │   │  S3: results bucket   │
+      │  idempotency ledger    │   │  key = same           │
+      │  ONLY — result_key =   │   │  "{tenant}/{conv_id}" │
+      │  "tenant::conv_id",    │   │  .json — the scored   │
+      │  conditional put       │   │  record itself lives  │
+      │  (mirrors local        │   │  here, not in DynamoDB│
+      │  results/index.json,   │   └───────────────────────┘
+      │  but O(1)/write, not   │
+      │  O(n) — see §6)        │
+      └────────────────────────┘
+```
+
 - **Worker:** ECS Fargate. Not Lambda — the model needs to stay loaded, not reload per invocation.
 - **Why SQS over Kafka:** one consumer group, one job per message. No need for independent fan-out or full-stream replay. SQS is zero-ops here; Kafka would just be an always-on cost.
 - **Scaling:** ECS autoscaling on SQS queue depth. Hard max task count, so a bad backfill re-queue can't run up an unbounded bill.
-- **Cost:** same order of magnitude as Section 6, ~$8/million with the current model.
+- **Cost:** ~\$616/mo steady state, ~\$4,065 one-time backfill, roberta on-demand — see §6's cost table.
 - **Bonus prototype — built for real:**
   - Verified with moto first (no real infra).
   - Then verified against a real LocalStack container: `25 processed, 1 skipped_duplicate, 2 dead_lettered`.
