@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from src import conversation as conv
 from src.metrics import DEFAULT_WEIGHTING, compute_overall_sentiment, compute_sentiment_trajectory
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"  # 1.1: per-turn `n_chunks`
 
 
 def result_key(tenant_id: str, conversation_id: str) -> str:
