@@ -24,6 +24,7 @@ comparison between them):
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,75 @@ MODEL_REGISTRY = {
 }
 DEFAULT_MODEL_KEY = "roberta"
 NEUTRAL_THRESHOLD = 0.2
+
+# The model's window is 512 tokens including the <s>/</s> special tokens.
+# Text longer than this used to be silently truncated, dropping whatever
+# came after the cutoff - see `SentimentScorer.score` for the chunking that
+# replaces that.
+MAX_MODEL_TOKENS = 512
+SPECIAL_TOKEN_BUDGET = 2
+CHUNK_TOKEN_LIMIT = MAX_MODEL_TOKENS - SPECIAL_TOKEN_BUDGET
+
+# Sentence boundaries, zero-width so no characters are lost: after a
+# Japanese/fullwidth terminator (no space follows in Japanese), after an
+# ASCII terminator that is followed by whitespace, and after a newline.
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？])|(?<=[.!?])(?=\s)|(?<=\n)")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Splits on sentence boundaries without dropping or altering any
+    character: `"".join(split_sentences(t)) == t`."""
+    return [part for part in _SENTENCE_BOUNDARY.split(text) if part]
+
+
+def _hard_split(piece: str, count_tokens, limit: int) -> list[str]:
+    """Last resort for a single sentence that alone exceeds `limit`: halve it
+    by characters until every part fits. Deterministic; may cut mid-word."""
+    if len(piece) <= 1 or count_tokens(piece) <= limit:
+        return [piece]
+    mid = len(piece) // 2
+    return _hard_split(piece[:mid], count_tokens, limit) + _hard_split(piece[mid:], count_tokens, limit)
+
+
+def chunk_text(text: str, count_tokens, limit: int = CHUNK_TOKEN_LIMIT) -> list[tuple[str, int]]:
+    """Packs whole sentences greedily into chunks of at most `limit` tokens.
+
+    Returns [(chunk_text, token_count), ...]. Sentence-aware so a negation
+    is never separated from what it negates ("not" / "good"); greedy
+    left-to-right with no randomness so the same text always chunks the same
+    way (byte-identical reruns). Text that already fits returns one chunk
+    that is the original text, untouched.
+    """
+    total = count_tokens(text)
+    if total <= limit:
+        return [(text, total)]
+
+    pieces = []
+    for sentence in split_sentences(text):
+        pieces.extend(_hard_split(sentence, count_tokens, limit))
+
+    chunks, current, current_tokens = [], "", 0
+    for piece in pieces:
+        n = count_tokens(piece)
+        # Token counts of adjacent pieces are near-additive; re-check the
+        # joined text for exactness instead of trusting the sum.
+        if current and count_tokens(current + piece) > limit:
+            chunks.append((current, current_tokens))
+            current = ""
+        current += piece
+        current_tokens = count_tokens(current) if current != piece else n
+    if current:
+        chunks.append((current, current_tokens))
+    return [(c.strip(), n) for c, n in chunks if c.strip()]
+
+
+def aggregate_probs(chunk_probs: list[tuple[dict, int]]) -> dict:
+    """Token-weighted mean of per-class probabilities across chunks. A
+    longer chunk says more of the text, so it counts for more. Repeating one
+    sentence N times leaves the mean unchanged."""
+    total = sum(weight for _, weight in chunk_probs) or 1
+    classes = {label for probs, _ in chunk_probs for label in probs}
+    return {c: sum(p.get(c, 0.0) * w for p, w in chunk_probs) / total for c in classes}
 
 
 class SentimentScorer:
@@ -82,20 +152,34 @@ class SentimentScorer:
     def score(self, text: str) -> dict:
         """Scores one piece of text. Assumes text is a non-empty string -
         the caller is responsible for deciding whether a turn has content
-        worth scoring at all."""
+        worth scoring at all.
+
+        Text over the model's window is split into sentence-aware chunks,
+        each chunk scored, and the per-class probabilities averaged
+        (token-weighted) before the label / signed score / confidence are
+        derived - so those keep exactly the meaning they have for short
+        text. `n_chunks` reports how many pieces were scored (1 for text
+        that fits, and always 1 for the VADER fallback, which has no
+        window limit). This lives here, not in src/scoring.py, so both
+        workers pick it up unchanged."""
         if self.backend_name == "transformer":
-            signed_score, confidence, label = self._score_with_transformer(text)
+            signed_score, confidence, label, n_chunks = self._score_with_transformer(text)
         else:
             signed_score, confidence = self._score_with_vader(text)
             label = self._label(signed_score)
+            n_chunks = 1
 
         return {
             "label": label,
             "score": round(signed_score, 4),
             "confidence": round(confidence, 4),
+            "n_chunks": n_chunks,
         }
 
-    def _score_with_transformer(self, text: str):
+    def _count_tokens(self, text: str) -> int:
+        return len(self._pipeline.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def _class_probs(self, text: str) -> dict:
         results = self._pipeline(text, top_k=None)
         # A single string input returns a flat list of {label, score} dicts,
         # one per class - but guard against the nested [[...]] shape some
@@ -106,10 +190,17 @@ class SentimentScorer:
         # (roberta: "positive"/"neutral"/"negative", distilbert:
         # "POSITIVE"/"NEGATIVE") - normalising here is what lets
         # `probs.get("positive")` below work for both.
-        probs = {r["label"].lower(): float(r["score"]) for r in results}
+        return {r["label"].lower(): float(r["score"]) for r in results}
+
+    def _score_with_transformer(self, text: str):
+        chunks = chunk_text(text, self._count_tokens)
+        if len(chunks) == 1:
+            probs = self._class_probs(chunks[0][0])
+        else:
+            probs = aggregate_probs([(self._class_probs(c), n) for c, n in chunks])
         predicted_label, confidence = max(probs.items(), key=lambda kv: kv[1])
         signed_score = probs.get("positive", 0.0) - probs.get("negative", 0.0)
-        return signed_score, confidence, predicted_label
+        return signed_score, confidence, predicted_label, len(chunks)
 
     def _score_with_vader(self, text: str):
         polarity = self._vader.polarity_scores(text)
