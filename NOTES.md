@@ -14,6 +14,7 @@
 | AWS backend | Design only, not built | Built. Verified with moto, then real LocalStack |
 | Idempotency ledger | Single-process safe only | Fixed race across multiple processes (`try_claim`) |
 | Reproducibility | `scored_at` was real time | Fixed `--scored-at`, plus `input_sha256` |
+| Long turns | Truncated at 512 tokens, rest dropped | Sentence-aware chunking + aggregation (§4.1). Schema `1.1` |
 
 Everything below is the full picture, current state.
 
@@ -119,10 +120,47 @@ Both computed over customer turns with real content only. Empty/whitespace text 
 - **Empty/whitespace text** — excluded from metrics, kept in output as `included_in_metrics: false`.
 - **Zero customer turns** — both metrics `null`.
 - **Empty `turns: []`** — same null result, no crash.
-- **4,000-char turn** — truncated at 512 tokens. Not chunked. Stated behavior, not silent.
+- **Turn over 512 tokens** — chunked and aggregated, not truncated. See §4.1.
 - **Unexpected scoring exception** — caught per-conversation. Dead-lettered like any other failure. One bad conversation can't take the batch down.
 
 All confirmed against the shipped sample fixtures.
+
+### 4.1 Long turns: chunk and aggregate
+
+Previously anything past 512 tokens was silently dropped, so a resolution at the end of a long message never counted. Now handled inside `SentimentScorer.score` (`src/sentiment_model.py`). `src/scoring.py` logic and both workers are untouched, so both backends get it.
+
+1. Count tokens with the model's own tokenizer. Limit is 510 (512 minus 2 special tokens).
+2. Fits → one model call, identical to before.
+3. Doesn't fit → split at sentence boundaries (`。！？`, `. ! ?` before whitespace, newlines), then pack sentences greedily into chunks under the limit.
+4. Score each chunk. Take the **token-weighted mean of per-class probabilities**, then derive label, score and confidence with the same formulas as short text.
+5. A single sentence over the limit is halved by characters until it fits. Last resort; can cut mid-word.
+
+Why it's built this way:
+- **Sentence-aware:** a hard cut can split "not" from "good".
+- **Deterministic:** no randomness, so `--scored-at` reruns stay byte-identical.
+- **Average probabilities, not labels:** keeps the meaning of the three output fields, and N repeats of a sentence score the same as one.
+- **Schema `1.1`:** each turn gains `n_chunks` (1 for short text, and always 1 on the VADER fallback).
+
+Tests: `tests/test_chunking.py`, using a fake scorer and tokenizer.
+
+**Verified on the real model:**
+- Full local run: 25 processed, 1 duplicate, 2 dead-lettered. All records are schema `1.1`. Two runs give the same SHA256.
+- 319 short turns compared with the pre-change results: 0 differences in label, score or confidence.
+- Only c-000027 turn 0 is over the window (854 tokens). It splits into 2 chunks: −0.9968 vs −0.9987 truncated.
+- AWS backend on real LocalStack: 25 processed, 1 duplicate, 2 dead-lettered via SQS redrive. Re-run: 0 processed, 26 duplicates. Records identical to the local run except `source_file`.
+
+Mixed sentiment, synthetic 600–781 token turns. Truncation would see only the opening:
+
+| Text | Result | Chunks |
+| --- | --- | --- |
+| Angry, then happy | negative, −0.67 (all-angry ≈ −0.99) | 2 |
+| Happy, then angry | negative, −0.82 | 2 |
+| Japanese angry, then happy | **positive, +0.40** (truncation: negative) | 2 |
+
+Limits:
+- The late text now counts, but the result depends slightly on order. Angry-first and happy-first differ (−0.67 vs −0.82) because each chunk sees different context. It is not an exact average.
+- Repeat invariance is approximate on the real model: one sentence −0.9977, 25 repeats −0.9987.
+- Cost impact is unmeasured. Long turns cost one forward pass per chunk. Sample turns are short, so §6 numbers are unchanged.
 
 ---
 
@@ -134,6 +172,7 @@ All confirmed against the shipped sample fixtures.
 | No retry with backoff  | AWS backend gets it free from SQS. |
 | Single worker process | **Closed.** `--workers N`, real processes. |
 | Unweighted mean only | **Half-closed.** `overall_sentiment` has `--weighting`. `sentiment_trajectory` unchanged, by design. |
+| Long turns truncated | **Closed.** Chunked and aggregated (§4.1). |
 | — (new cost, from the model swap) | Roberta is 4.7x–6.4x slower than distilbert. Taken on deliberately, to fix non-English scoring. |
 
 ---
@@ -174,7 +213,7 @@ Steady state, 2M/day = 60M conversations/month:
 | DynamoDB (60M conditional-put writes) | ~\$75/mo | ~\$75/mo |
 | **Total** | **~\$228/mo** | **~\$616/mo** |
 
-- roberta is the shipped default: ~\$616/mo, not \$300-400/mo. That range is an 8-vCPU flat assumption — closer to distilbert's 3.6 cores than roberta's measured 16.9.
+- roberta is the shipped default: ~\$616/mo. That range is an 8-vCPU flat assumption — closer to distilbert's 3.6 cores than roberta's measured 16.9.
 - S3 (transcript + result writes, growing storage) not in the table — order of \$20-30/mo, small next to compute either way.
 
 Backfill, 500M conversations, one-time (cost/million × 500):
@@ -279,3 +318,4 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 6. A human-labeled, real support-transcript set, for an actual accuracy number.
 7. Sarcasm / double-negation handling — still broken on both models tried so far.
 8. Retries with backoff on the local backend (AWS backend already gets this from SQS).
+9. Measure chunking's throughput cost on a set of genuinely long, real transcripts (behavior is verified, §4.1; cost is not).
