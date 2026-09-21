@@ -191,14 +191,14 @@ Measured on one CPU core, no GPU, single-conversation-set benchmark.
 | Cost / million conversations, spot | ~\$0.52–0.69 | ~\$2.45–3.25 |
 
 - Bottleneck is model inference, not I/O. A forward pass is ~13ms (distilbert) / ~61ms (roberta).
-- Batching (`batch_size=32`) measured *slower* than unbatched, on distilbert. Padding waste from mixed turn lengths. Not re-tested on roberta.
+- Batching (`batch_size=32`) measured *slower* than unbatched, on distilbert. Padding waste from mixed turn lengths. That measurement was of unsorted batches; the pipeline now sorts by length first (§6.1). **Not re-measured** - the throughput numbers in this table are still the old unbatched ones.
 - A same-day, back-to-back comparison (separate ad-hoc script, not shipped in this repo) put the gap at 6.4x, not 4.7x — the two headline numbers above were measured on different days. Same-day table: distilbert 96.3 t/s, roberta 15.1 t/s.
 
 **What breaks first at 10x** (2M/day → 20M/day):
 1. Worker fleet size — solved by autoscaling.
 2. The idempotency ledger. It rewrites the whole seen-set on every write. `O(n)`. This is the real bottleneck, before fleet size is.
 
-**Scaling levers, by effort:** more workers (done) → length-bucketed batching (unverified) → ONNX + INT8 quantization (estimated 2–4x, not measured) → temporary GPU for the backfill only.
+**Scaling levers, by effort:** more workers (done) → length-sorted batching + sharding (built, §6.1; throughput gain not measured) → ONNX + INT8 quantization (estimated 2–4x, not measured) → temporary GPU for the backfill only.
 
 **Cost, as \$/month and \$/backfill (assumptions stated, not measured):**
 
@@ -224,6 +224,29 @@ Backfill, 500M conversations, one-time (cost/million × 500):
 | Spot | ~\$260-345 | ~\$1,225-1,625 |
 
 - roberta's on-demand backfill (~\$4,065) is ≈6.6 months of its own steady-state bill, not a separate order of magnitude. It's a one-time bump worth sizing, not the number to fear.
+
+---
+
+### 6.1 Uneven work: one conversation is 200 turns, another is 1
+
+Cost per conversation varies ~200x (c-000028 has 200 turns). Two separate problems: throughput *inside* one conversation, and balance *across* workers.
+
+**Inside a conversation**
+- **Batched turns.** `scoring.score_turns` collects every scorable turn and makes one `scorer.score_batch` call instead of one model call per turn. Scorers without `score_batch` fall back to per-turn calls.
+- **Sorted by length.** `SentimentScorer.score_batch` pools all chunks, sorts by token count (longest first, index tiebreak), cuts batches of `BATCH_SIZE=32`, and scatters results back by index. That is the fix for the padding waste behind the earlier "batching was slower" result.
+- Output is identical to unbatched on the shipped data (VADER fallback; the transformer path is covered by unit tests with a fake model). With the real model, padding can move a score in the last float digits; scores are rounded to 4 dp, so an occasional 4th-decimal difference from pre-batching runs is possible.
+
+**Across workers**
+- **Longest-processing-time-first.** Local: each queued file has a cost sidecar (`*.cost`), and `FileQueue.list_pending` sorts by cost descending. Workers walk that list claiming what they can, so big jobs start first and small ones fill the tail. AWS: `run.py` sends tasks in descending cost order. A *standard* SQS queue is only best-effort ordered, so there it is a hint, not a guarantee; strict order needs FIFO (lower throughput, more cost). Cost = turn count, a cheap proxy that ignores turn length.
+- **Sharding** (`src/sharding.py`). Conversations over `SHARD_MAX_TURNS=50` turns are split into contiguous, near-equal shards (200 turns → 4 x 50), so no task is bigger than 50 turns. Turns score independently, so a shard just scores its slice and parks `{turn index: score}` (local `queue/shards/`, AWS `s3://<conversations-bucket>/shards/`). Every shard writes its partial *then* counts the partials, so whichever lands last sees them all and assembles the normal record via `evaluate(..., turn_scores=merged)`. The ledger's `try_claim` covers two shards finishing at once. A sharded conversation produced a byte-identical `results.json` to the unsharded baseline, with 1 and with 3 workers.
+- **Visibility timeout sized for the worst case.** A worker receives `RECEIVE_BATCH_SIZE=5` messages, all invisible at once, but processes them serially, so the last one must outlive the whole batch. `visibility_timeout = ceil(batch x worst_case_task_seconds)` = 5 x 6s = **30s** (was a fixed 5s; a 200-turn conversation alone is ~12s on roberta). Too short means SQS redelivers work still in flight: duplicate scoring, and each redelivery burns a `maxReceiveCount` attempt, so healthy messages can hit the DLQ. Sharding is what makes the worst-case task a *bounded* number. Override with `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTIMENT_WORST_TASK_SECONDS`. `--aws-drain-timeout` default went 60s → 150s so a failing message can still complete 3 redrive cycles.
+
+**Limits / not done**
+- The 6s worst-case figure is an estimate (50 turns at the measured 16 turns/s, doubled), not a measured p99. If a task can exceed it, the next step is a `ChangeMessageVisibility` heartbeat.
+- Turn count ignores turn length; one huge chunked turn is bigger than its cost says.
+- Local backend: a shard that dead-letters leaves the conversation without a result and without its own error entry (the shard file is in `dead_letter/`). AWS: the shard reaches the DLQ; the errors report notes which shard.
+- Shard partials are never deleted. Add an S3 lifecycle expiry on `shards/`.
+- Throughput/latency gains from batching, sharding and LPT are **not benchmarked** (the real model was not available here); correctness is tested. Not run against real LocalStack either - only moto.
 
 ---
 
@@ -313,7 +336,7 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 1. Continuous poll loop instead of the current bounded drain-and-exit.
 2. CloudWatch alarm on DLQ depth, wired to actually page someone.
 3. A standalone "volatility" metric, if the product ever needs to tell "flat" apart from "chaotic but flat."
-4. Length-bucketed batching, re-measured against current baselines.
+4. Benchmark length-sorted batching and pick `BATCH_SIZE` / `SHARD_MAX_TURNS` from data (both are first guesses).
 5. ONNX Runtime + INT8 quantization — highest-value unmeasured lever, given roberta's cost.
 6. A human-labeled, real support-transcript set, for an actual accuracy number.
 7. Sarcasm / double-negation handling — still broken on both models tried so far.

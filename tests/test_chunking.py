@@ -19,6 +19,9 @@ class FakeChunkScorer(SentimentScorer):
     def _count_tokens(self, text):
         return word_count(text)
 
+    def _class_probs_batch(self, chunks, lengths):
+        return [self._class_probs(c) for c in chunks]
+
     def _class_probs(self, text):
         positive = "good" in text and "not good" not in text
         return {"positive": 0.9, "negative": 0.1} if positive else {"positive": 0.1, "negative": 0.9}

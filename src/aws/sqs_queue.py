@@ -29,9 +29,14 @@ class SqsQueue:
         self.queue_url = queue_url
         self.dlq_url = dlq_url
 
-    def enqueue(self, tenant_id: str, conversation_id: str):
-        """Sends a pointer, not the transcript - see s3_store.py."""
-        body = json.dumps({"tenant_id": tenant_id, "conversation_id": conversation_id})
+    def enqueue(self, tenant_id: str, conversation_id: str, shard: dict | None = None):
+        """Sends a pointer, not the transcript - see s3_store.py. `shard`
+        ({"index", "count", "start", "end"}, see src/sharding.py) points at
+        one slice of a large conversation instead of the whole thing."""
+        payload = {"tenant_id": tenant_id, "conversation_id": conversation_id}
+        if shard:
+            payload["shard"] = shard
+        body = json.dumps(payload)
         self.sqs.send_message(QueueUrl=self.queue_url, MessageBody=body)
 
     def receive_batch(self, max_messages: int = 10, wait_time_seconds: int = 1) -> list:

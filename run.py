@@ -12,6 +12,7 @@ from src.conversation import parse_timestamp
 from src.metrics import DEFAULT_WEIGHTING, WEIGHTING_CHOICES
 from src.queue_store import FileQueue
 from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer
+from src.sharding import estimate_cost, plan_shards
 from src.worker import Worker
 
 logger = logging.getLogger(__name__)
@@ -77,10 +78,25 @@ def run_local(args):
 
     queue = FileQueue(work_dir)
     enqueued = 0
+    sharded = 0
     for source_file in sorted(input_dir.glob("*.json")):
-        queue.enqueue(source_file)
+        try:
+            raw_doc = json.loads(source_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_doc = None  # enqueue as-is; the worker dead-letters it with the real reason
+        shards = plan_shards(raw_doc)
+        if not shards:
+            queue.enqueue(source_file, cost=estimate_cost(raw_doc))
+        else:
+            for shard in shards:
+                queue.enqueue_task(
+                    f"{source_file.stem}.shard-{shard['index']:04d}-of-{shard['count']:04d}.json",
+                    {"shard_task": {"source_file": source_file.name, "shard": shard, "doc": raw_doc}},
+                    cost=shard["end"] - shard["start"],
+                )
+            sharded += 1
         enqueued += 1
-    logger.info("Enqueued %d conversation file(s) from %s", enqueued, input_dir)
+    logger.info("Enqueued %d conversation file(s) from %s (%d split into shards)", enqueued, input_dir, sharded)
 
     if args.workers <= 1:
         logger.info("Loading sentiment model %s (downloads on first run if not already cached)...",
@@ -147,7 +163,7 @@ def run_aws(args):
     from src.aws.clients import AwsClients
     from src.aws.config import AwsConfig
     from src.aws.dynamo_ledger import DynamoResultIndex
-    from src.aws.s3_store import S3ConversationStore, S3ResultStore
+    from src.aws.s3_store import S3ConversationStore, S3ResultStore, S3ShardStore
     from src.aws.sqs_queue import SqsQueue
     from src.aws.worker import AwsWorker
 
@@ -168,6 +184,7 @@ def run_aws(args):
     ledger = DynamoResultIndex(clients, config.ledger_table_name)
     queue = SqsQueue(clients, infra["queue_url"], infra["dlq_url"])
 
+    tasks = []  # (cost, tenant_id, conversation_id, shard or None)
     enqueued = 0
     for source_file in sorted(input_dir.glob("*.json")):
         raw_doc = json.loads(source_file.read_text(encoding="utf-8"))
@@ -179,24 +196,39 @@ def run_aws(args):
             # proper dead-letter reason via the normal validation path.
             tenant_id, conversation_id = "unknown", source_file.stem
         conversations.put(tenant_id, conversation_id, raw_doc)
-        queue.enqueue(tenant_id, conversation_id)
+        shards = plan_shards(raw_doc)
+        if shards:
+            tasks.extend((shard["end"] - shard["start"], tenant_id, conversation_id, shard) for shard in shards)
+        else:
+            tasks.append((estimate_cost(raw_doc), tenant_id, conversation_id, None))
         enqueued += 1
-    logger.info("Enqueued %d conversation file(s) from %s", enqueued, input_dir)
+
+    # Longest-processing-time-first: send the biggest tasks first. A standard
+    # SQS queue is only best-effort ordered, so this is a strong hint, not a
+    # guarantee (NOTES.md 6.1).
+    tasks.sort(key=lambda task: -task[0])
+    for _, tenant_id, conversation_id, shard in tasks:
+        queue.enqueue(tenant_id, conversation_id, shard=shard)
+    logger.info("Enqueued %d conversation file(s) from %s as %d task(s)", enqueued, input_dir, len(tasks))
 
     logger.info("Loading sentiment model %s (downloads on first run if not already cached)...", args.model)
     scorer = SentimentScorer(model_key=args.model)
     logger.info("Using scoring backend: %s (%s @ %s)",
                 scorer.backend_name, scorer.model_name, scorer.model_revision)
 
+    shard_store = S3ShardStore(clients, config.conversations_bucket)
     worker = AwsWorker(queue, conversations, results_store, ledger, scorer, scored_at=args.scored_at,
-                        weighting=args.weighting)
+                        weighting=args.weighting, shard_store=shard_store)
 
-    summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0}
+    logger.info("Visibility timeout %ds for receive batches of %d (worst-case task %.0fs)",
+                config.visibility_timeout_seconds, config.receive_batch_size, config.worst_case_task_seconds)
+    summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0, "shards_scored": 0}
 
     idle_passes = 0
     deadline = time.monotonic() + args.aws_drain_timeout
     while time.monotonic() < deadline:
-        batch = worker.run_once()
+        batch = worker.run_once(max_messages=config.receive_batch_size)
+        summary["shards_scored"] += batch["shards_scored"]
         summary["processed"] += batch["processed"]
         summary["skipped_duplicate"] += batch["skipped_duplicate"]
         summary["retry_attempts"] += batch["left_for_retry"]
@@ -239,7 +271,7 @@ def main():
                          help="[local backend only] Number of worker processes to run against the same --work-dir.")
     parser.add_argument("--weighting", choices=WEIGHTING_CHOICES, default=DEFAULT_WEIGHTING,
                          help=f"How overall_sentiment averages per-turn scores (default: {DEFAULT_WEIGHTING}); see src/metrics.py.")
-    parser.add_argument("--aws-drain-timeout", type=float, default=60.0,
+    parser.add_argument("--aws-drain-timeout", type=float, default=150.0,
                          help="[aws backend only] Max seconds to keep draining the queue before giving up.")
     parser.add_argument("--log-dir", default="logs",
                          help="Where per-run log files are written.")

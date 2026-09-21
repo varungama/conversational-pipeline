@@ -22,10 +22,11 @@ from src.aws.bootstrap import ensure_infrastructure
 from src.aws.clients import AwsClients
 from src.aws.config import AwsConfig
 from src.aws.dynamo_ledger import DynamoResultIndex
-from src.aws.s3_store import S3ConversationStore, S3ResultStore
+from src.aws.s3_store import S3ConversationStore, S3ResultStore, S3ShardStore
 from src.aws.sqs_queue import SqsQueue
 from src.aws.worker import AwsWorker
-from src.scoring import result_key
+from src.scoring import evaluate, result_key
+from src.sharding import plan_shards
 from tests.stub_scorer import StubScorer
 
 
@@ -56,7 +57,9 @@ class TestAwsWorker(unittest.TestCase):
         self.results = S3ResultStore(self.clients, self.config.results_bucket)
         self.ledger = DynamoResultIndex(self.clients, self.config.ledger_table_name)
         self.queue = SqsQueue(self.clients, infra["queue_url"], infra["dlq_url"])
-        self.worker = AwsWorker(self.queue, self.conversations, self.results, self.ledger, StubScorer())
+        self.shard_store = S3ShardStore(self.clients, self.config.conversations_bucket)
+        self.worker = AwsWorker(self.queue, self.conversations, self.results, self.ledger, StubScorer(),
+                                shard_store=self.shard_store)
 
     def _submit(self, tenant_id, conversation_id, doc):
         self.conversations.put(tenant_id, conversation_id, doc)
@@ -125,6 +128,35 @@ class TestAwsWorker(unittest.TestCase):
         self.assertEqual(len(dead_letters), 1)
         self.assertEqual(dead_letters[0]["source_file"], "acme/c-4.json")
         self.assertEqual(self.queue.approximate_depth(), 0)
+
+    def test_sharded_conversation_is_merged_into_one_result_equal_to_unsharded(self):
+        turns = [{"seq": i, "role": "customer", "ts": f"2026-03-02T09:{i // 60:02d}:{i % 60:02d}Z",
+                  "text": ["GOOD", "BAD", "MEH"][i % 3]} for i in range(120)]
+        doc = {"conversation_id": "c-big", "tenant_id": "acme", "channel": "chat", "turns": turns}
+        self.conversations.put("acme", "c-big", doc)
+        shards = plan_shards(doc)
+        self.assertEqual(len(shards), 3)
+        for shard in shards:
+            self.queue.enqueue("acme", "c-big", shard=shard)
+
+        summary = {"processed": 0, "shards_scored": 0}
+        while self.queue.approximate_depth() > 0:
+            batch = self.worker.run_once()
+            summary["processed"] += batch["processed"]
+            summary["shards_scored"] += batch["shards_scored"]
+
+        self.assertEqual(summary, {"processed": 1, "shards_scored": 2})
+        results = self.results.list_all()
+        self.assertEqual(len(results), 1)
+        expected = evaluate(doc, StubScorer(), "acme/c-big.json")[3]
+        expected["scored_at"] = results[0]["scored_at"]
+        self.assertEqual(results[0], expected)
+
+        # a redelivered shard after completion is a no-op
+        self.queue.enqueue("acme", "c-big", shard=shards[0])
+        again = self.worker.run_once()
+        self.assertEqual(again["skipped_duplicate"], 1)
+        self.assertEqual(len(self.results.list_all()), 1)
 
     def test_pointer_message_never_carries_the_transcript(self):
         doc = {

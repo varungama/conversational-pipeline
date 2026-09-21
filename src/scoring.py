@@ -44,8 +44,31 @@ def input_content_hash(raw_doc) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _score_texts(scorer, texts: list) -> list:
+    """One batched model call for all texts when the scorer supports it, so
+    a conversation's turns share forward passes instead of paying one each.
+    Scorers without `score_batch` fall back to one call per text."""
+    if not texts:
+        return []
+    score_batch = getattr(scorer, "score_batch", None)
+    if score_batch is not None:
+        return score_batch(texts)
+    return [scorer.score(text) for text in texts]
+
+
+def score_turns(turn_results, scorer, indices=None) -> dict:
+    """Scores every scorable turn (valid, non-empty text) in one batch.
+    Returns {turn index: score dict}. `indices`, if given, restricts scoring
+    to those turn indices - that is how a shard scores its slice."""
+    todo = [t for t in turn_results
+            if t["status"] == "ok" and t["has_content"] and (indices is None or t["index"] in indices)]
+    scored = _score_texts(scorer, [t["text"] for t in todo])
+    return {t["index"]: s for t, s in zip(todo, scored)}
+
+
 def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer, source_ref,
-                        scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING) -> dict:
+                        scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING,
+                        turn_scores: dict | None = None) -> dict:
     """Builds the full output record for one already-validated conversation.
 
     `turn_results` is the list returned by `conversation.load_conversation`.
@@ -58,7 +81,14 @@ def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer
     input produce byte-identical output - every other field here is already
     deterministic given the same input and the same pinned model revision,
     so `scored_at` is the only source of run-to-run difference otherwise.
+
+    `turn_scores` ({turn index: score dict}) supplies scores computed
+    elsewhere - the merged partials of a sharded conversation. When omitted,
+    every turn is scored here in one batch.
     """
+    if turn_scores is None:
+        turn_scores = score_turns(turn_results, scorer)
+
     scored_turns = []
     customer_scores_unordered = []   # (signed_score, confidence) - order does not matter for a mean
     customer_scores_by_time = []     # (parsed_ts, signed_score) - order matters for trajectory
@@ -88,7 +118,7 @@ def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer
             scored_turns.append(entry)
             continue
 
-        scored = scorer.score(turn["text"])
+        scored = turn_scores[turn["index"]]
         is_customer = turn["role"] == "customer"
         entry.update(scored, included_in_metrics=is_customer)
         if not is_customer:
@@ -132,7 +162,8 @@ def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer
     }
 
 
-def evaluate(raw_doc, scorer, source_ref, scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING):
+def evaluate(raw_doc, scorer, source_ref, scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING,
+             turn_scores: dict | None = None):
     """Runs the full validate-then-score pipeline for one raw document.
 
     Returns a tuple:
@@ -145,6 +176,7 @@ def evaluate(raw_doc, scorer, source_ref, scored_at: str | None = None, weightin
 
     `scored_at`, if given, overrides the output record's timestamp - see
     `score_conversation` for why that is the byte-identical-reruns knob.
+    `turn_scores`, if given, are precomputed per-turn scores (sharded path).
     """
     tenant_id, conversation_id = extract_identity(raw_doc)
     if not tenant_id or not conversation_id:
@@ -156,5 +188,5 @@ def evaluate(raw_doc, scorer, source_ref, scored_at: str | None = None, weightin
         return ("dead_letter", str(exc))
 
     record = score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer, source_ref,
-                                 scored_at=scored_at, weighting=weighting)
+                                 scored_at=scored_at, weighting=weighting, turn_scores=turn_scores)
     return ("ok", tenant_id, conversation_id, record)
