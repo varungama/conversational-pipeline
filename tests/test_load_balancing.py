@@ -1,15 +1,9 @@
-import json
-import pathlib
-import shutil
-import tempfile
 import unittest
 
 from src.aws.config import AwsConfig, worst_case_visibility_timeout
-from src.queue_store import FileQueue
 from src.scoring import evaluate
 from src.sentiment_model import SentimentScorer, length_sorted_batches
 from src.sharding import SHARD_MAX_TURNS, estimate_cost, plan_shards
-from src.worker import Worker
 from tests.stub_scorer import BatchStubScorer, StubScorer
 
 
@@ -84,72 +78,6 @@ class TestSharding(unittest.TestCase):
         self.assertEqual(estimate_cost(make_doc("c", 200)), 200)
         self.assertEqual(estimate_cost({"turns": "x"}), 1)
         self.assertEqual(estimate_cost(None), 1)
-
-
-class TestLocalDispatch(unittest.TestCase):
-    def setUp(self):
-        self.tmp = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.queue = FileQueue(self.tmp / "queue")
-        self.results = self.tmp / "results"
-
-    def _enqueue(self, doc):
-        """Mirrors the local enqueue loop in run.py."""
-        source = self.tmp / f"{doc['tenant_id']}__{doc['conversation_id']}.json"
-        source.write_text(json.dumps(doc), encoding="utf-8")
-        shards = plan_shards(doc)
-        if not shards:
-            self.queue.enqueue(source, cost=estimate_cost(doc))
-            return
-        for shard in shards:
-            self.queue.enqueue_task(
-                f"{source.stem}.shard-{shard['index']:04d}-of-{shard['count']:04d}.json",
-                {"shard_task": {"source_file": source.name, "shard": shard, "doc": doc}},
-                cost=shard["end"] - shard["start"])
-
-    def test_pending_is_longest_first_with_name_tiebreak(self):
-        for doc in [make_doc("c-a", 3), make_doc("c-b", 30), make_doc("c-c", 3), make_doc("c-d", 12)]:
-            self._enqueue(doc)
-        self.assertEqual([p.name for p in self.queue.list_pending()],
-                         ["acme__c-b.json", "acme__c-d.json", "acme__c-a.json", "acme__c-c.json"])
-
-    def test_claimed_file_leaves_no_cost_sidecar_behind(self):
-        self._enqueue(make_doc("c-a", 3))
-        self.queue.claim(self.queue.list_pending()[0])
-        self.assertEqual(list(self.queue.pending.iterdir()), [])
-
-    def test_sharded_result_equals_unsharded_result(self):
-        doc = make_doc("c-big", 130)
-        whole = evaluate(doc, StubScorer(), "acme__c-big.json", scored_at="2026-03-02T10:00:00Z")[3]
-
-        self._enqueue(doc)
-        self.assertEqual(len(self.queue.list_pending()), 3)  # 130 turns -> 3 shards
-        worker = Worker(self.queue, self.results, BatchStubScorer(), scored_at="2026-03-02T10:00:00Z")
-        summary = worker.run_once()
-
-        self.assertEqual(summary["processed"], 1)
-        self.assertEqual(summary["shards_scored"], 2)
-        self.assertEqual(summary["dead_lettered"], 0)
-        record = json.loads((self.results / "acme__c-big.json").read_text(encoding="utf-8"))
-        self.assertEqual(record, whole)
-
-    def test_two_workers_sharing_a_sharded_conversation_write_one_result(self):
-        self._enqueue(make_doc("c-big", 200))
-        workers = [Worker(self.queue, self.results, StubScorer()), Worker(self.queue, self.results, StubScorer())]
-        # interleave: each takes shards in turn, as concurrent workers would
-        for i, path in enumerate(self.queue.list_pending()):
-            workers[i % 2]._process_one(self.queue.claim(path))
-        self.assertEqual(len(list(self.results.glob("acme__c-big.json"))), 1)
-
-    def test_redelivered_shards_after_completion_are_skipped(self):
-        doc = make_doc("c-big", 100)
-        self._enqueue(doc)
-        worker = Worker(self.queue, self.results, StubScorer())
-        worker.run_once()
-        self._enqueue(doc)  # same conversation delivered again
-        summary = worker.run_once()
-        self.assertEqual(summary["processed"], 0)
-        self.assertEqual(summary["skipped_duplicate"], 2)
 
 
 class TestVisibilityTimeout(unittest.TestCase):

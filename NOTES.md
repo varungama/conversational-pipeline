@@ -15,6 +15,7 @@
 | Idempotency ledger | Single-process safe only | Fixed race across multiple processes (`try_claim`) |
 | Reproducibility | `scored_at` was real time | Fixed `--scored-at`, plus `input_sha256` |
 | Long turns | Truncated at 512 tokens, rest dropped | Sentence-aware chunking + aggregation (§4.1). Schema `1.1` |
+| Uneven work | One model call per turn; whole conversation = one task | Length-sorted batching, sharding, longest-first dispatch, worst-case visibility timeout (§6.1) |
 
 Everything below is the full picture, current state.
 
@@ -72,7 +73,7 @@ Two backends. One scoring path (`src/scoring.py`), shared by both. They can't si
 
 **Local (default):**
 - Directory tree: `queue/pending`, `processing`, `done`, `dead_letter`.
-- Claim = `os.rename`. Atomic. That's the whole locking mechanism.
+- Claim = `os.rename`. Atomic on POSIX. That's the whole locking mechanism.
 - Cut on purpose: a crash mid-claim leaves a file stuck in `processing/` forever. No retry.
 
 **AWS (`--backend aws`):**
@@ -227,26 +228,31 @@ Backfill, 500M conversations, one-time (cost/million × 500):
 
 ---
 
-### 6.1 Uneven work: one conversation is 200 turns, another is 1
+### 6.1 Uneven work: 1 turn vs 200 turns (AWS backend)
 
-Cost per conversation varies ~200x (c-000028 has 200 turns). Two separate problems: throughput *inside* one conversation, and balance *across* workers.
+Cost per conversation varies ~200x (c-000028 has 200 turns). Two problems: throughput inside a conversation, and balance across workers.
 
-**Inside a conversation**
-- **Batched turns.** `scoring.score_turns` collects every scorable turn and makes one `scorer.score_batch` call instead of one model call per turn. Scorers without `score_batch` fall back to per-turn calls.
-- **Sorted by length.** `SentimentScorer.score_batch` pools all chunks, sorts by token count (longest first, index tiebreak), cuts batches of `BATCH_SIZE=32`, and scatters results back by index. That is the fix for the padding waste behind the earlier "batching was slower" result.
-- Output is identical to unbatched on the shipped data (VADER fallback; the transformer path is covered by unit tests with a fake model). With the real model, padding can move a score in the last float digits; scores are rounded to 4 dp, so an occasional 4th-decimal difference from pre-batching runs is possible.
+| Fix | What it does | Where |
+| --- | --- | --- |
+| Batch turns | One `score_batch` call per conversation instead of one model call per turn. Scorers without `score_batch` fall back to per-turn. | `scoring.score_turns` |
+| Sort by length | Pool all chunks, sort longest-first, cut batches of `BATCH_SIZE=32`, scatter results back by index. Removes the padding waste behind the old "batching was slower" result. | `SentimentScorer.score_batch` |
+| Longest-first dispatch | `run.py` sends tasks to SQS in descending cost order (cost = turn count). Standard SQS is only best-effort ordered, so this is a hint, not a guarantee. | `run.py` |
+| Shard huge conversations | Over `SHARD_MAX_TURNS=50` turns, the conversation becomes contiguous shard messages (200 → 4×50). Each shard scores its slice and parks `{turn: score}` in S3 (`shards/`); the last to land merges via `evaluate(..., turn_scores=)`. Ledger `try_claim` covers a simultaneous finish; a redelivered shard after completion is skipped via `ledger.has`. | `sharding.py`, `S3ShardStore`, `aws/worker.py` |
+| Visibility timeout for worst case | A worker's batch of 5 messages is all invisible but processed serially, so the last must outlive the batch: `ceil(5 x 6s) = 30s` (was fixed 5s). Too short: SQS redelivers in-flight work and burns `maxReceiveCount`, sending healthy messages to the DLQ. Sharding is what bounds the worst-case task. `--aws-drain-timeout` 60s → 150s so 3 redrives fit. | `aws/config.py` |
 
-**Across workers**
-- **Longest-processing-time-first.** Local: each queued file has a cost sidecar (`*.cost`), and `FileQueue.list_pending` sorts by cost descending. Workers walk that list claiming what they can, so big jobs start first and small ones fill the tail. AWS: `run.py` sends tasks in descending cost order. A *standard* SQS queue is only best-effort ordered, so there it is a hint, not a guarantee; strict order needs FIFO (lower throughput, more cost). Cost = turn count, a cheap proxy that ignores turn length.
-- **Sharding** (`src/sharding.py`). Conversations over `SHARD_MAX_TURNS=50` turns are split into contiguous, near-equal shards (200 turns → 4 x 50), so no task is bigger than 50 turns. Turns score independently, so a shard just scores its slice and parks `{turn index: score}` (local `queue/shards/`, AWS `s3://<conversations-bucket>/shards/`). Every shard writes its partial *then* counts the partials, so whichever lands last sees them all and assembles the normal record via `evaluate(..., turn_scores=merged)`. The ledger's `try_claim` covers two shards finishing at once. A sharded conversation produced a byte-identical `results.json` to the unsharded baseline, with 1 and with 3 workers.
-- **Visibility timeout sized for the worst case.** A worker receives `RECEIVE_BATCH_SIZE=5` messages, all invisible at once, but processes them serially, so the last one must outlive the whole batch. `visibility_timeout = ceil(batch x worst_case_task_seconds)` = 5 x 6s = **30s** (was a fixed 5s; a 200-turn conversation alone is ~12s on roberta). Too short means SQS redelivers work still in flight: duplicate scoring, and each redelivery burns a `maxReceiveCount` attempt, so healthy messages can hit the DLQ. Sharding is what makes the worst-case task a *bounded* number. Override with `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTIMENT_WORST_TASK_SECONDS`. `--aws-drain-timeout` default went 60s → 150s so a failing message can still complete 3 redrive cycles.
+Env overrides: `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTIMENT_WORST_TASK_SECONDS`.
 
-**Limits / not done**
-- The 6s worst-case figure is an estimate (50 turns at the measured 16 turns/s, doubled), not a measured p99. If a task can exceed it, the next step is a `ChangeMessageVisibility` heartbeat.
-- Turn count ignores turn length; one huge chunked turn is bigger than its cost says.
-- Local backend: a shard that dead-letters leaves the conversation without a result and without its own error entry (the shard file is in `dead_letter/`). AWS: the shard reaches the DLQ; the errors report notes which shard.
-- Shard partials are never deleted. Add an S3 lifecycle expiry on `shards/`.
-- Throughput/latency gains from batching, sharding and LPT are **not benchmarked** (the real model was not available here); correctness is tested. Not run against real LocalStack either - only moto.
+**Verified (VADER fallback; real model not installed here):**
+- 59 tests pass, including moto shard-merge (sharded result equals unsharded; redelivered shard is a no-op).
+- Real LocalStack: 25 processed, 1 duplicate skipped, 3 shards scored and merged, 2 dead-lettered after 3 retries each, inside the 150s drain. Rerun on the same ledger: 0 processed, 29 skipped.
+
+**Not done / limits**
+- Speedups are **not benchmarked**. `BATCH_SIZE`, `SHARD_MAX_TURNS` and the 6s worst-case task are first guesses (50 turns at 16 turns/s, doubled). If a task can exceed 6s, add a `ChangeMessageVisibility` heartbeat.
+- Turn count ignores turn length; one huge chunked turn costs more than it says.
+- A dead-lettered shard reaches the DLQ; the errors report names it, but its conversation gets no result.
+- Shard partials are never deleted; add an S3 lifecycle expiry on `shards/`.
+- With the real model, batching padding can move a score in the 4th decimal versus pre-batching runs.
+- Local backend (`--backend local`) is unchanged by this work: no sharding or cost ordering. It does use the batched scoring path.
 
 ---
 

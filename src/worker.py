@@ -23,10 +23,8 @@ import pathlib
 from src.metrics import DEFAULT_WEIGHTING
 from src.queue_store import FileQueue
 from src.result_index import ResultIndex
-from src.scoring import evaluate, extract_identity, result_key
+from src.scoring import evaluate, result_key
 from src.sentiment_model import SentimentScorer
-from src.shard_store import ShardStore
-from src.sharding import merge_partials, score_shard
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +37,6 @@ class Worker:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.scorer = scorer
         self.index = ResultIndex(results_dir / "index.json")
-        # Partial scores of sharded conversations live with the queue, not
-        # the results, so they never show up in the results listing.
-        self.shards = ShardStore(queue.root / "shards")
         # Overrides every record's `scored_at` when set - see src/scoring.py.
         # Used to make a rerun over unchanged input byte-identical to a
         # prior run, instead of differing only in real wall-clock time.
@@ -66,9 +61,6 @@ class Worker:
         except (OSError, json.JSONDecodeError) as exc:
             self.queue.mark_dead(path, f"unreadable_json: {exc}")
             return "dead_lettered"
-
-        if isinstance(raw_doc, dict) and "shard_task" in raw_doc:
-            return self._process_shard(path, raw_doc["shard_task"])
 
         # Peek at identity before scoring, purely so a duplicate delivery
         # can be recognised and skipped without paying for model inference.
@@ -99,43 +91,6 @@ class Worker:
             self.queue.mark_dead(path, reason)
             return "dead_lettered"
 
-        return self._persist(path, outcome)
-
-    def _process_shard(self, path: pathlib.Path, task: dict) -> str:
-        """Scores one slice of a large conversation and parks the partial.
-        The worker that lands the last slice merges them into the normal
-        result record (see src/sharding.py)."""
-        doc, shard = task["doc"], task["shard"]
-        tenant_id, conversation_id = extract_identity(doc)
-        if self.index.has(result_key(tenant_id, conversation_id)):
-            self.queue.mark_done(path)
-            return "skipped_duplicate"
-
-        try:
-            self.shards.put(tenant_id, conversation_id, shard["index"], score_shard(doc, shard, self.scorer))
-        except Exception as exc:
-            logger.exception("Unexpected error scoring shard %s", path.name)
-            self.queue.mark_dead(path, f"scoring_failed: {exc}")
-            return "dead_lettered"
-
-        if len(self.shards.indexes(tenant_id, conversation_id)) < shard["count"]:
-            self.queue.mark_done(path)
-            return "shards_scored"
-
-        merged = merge_partials(self.shards.load(tenant_id, conversation_id))
-        try:
-            outcome = evaluate(doc, self.scorer, source_ref=task["source_file"], scored_at=self.scored_at,
-                                weighting=self.weighting, turn_scores=merged)
-        except Exception as exc:
-            logger.exception("Unexpected error merging shards for %s", path.name)
-            self.queue.mark_dead(path, f"scoring_failed: {exc}")
-            return "dead_lettered"
-        if outcome[0] == "dead_letter":
-            self.queue.mark_dead(path, outcome[1])
-            return "dead_lettered"
-        return self._persist(path, outcome)
-
-    def _persist(self, path: pathlib.Path, outcome) -> str:
         _, tenant_id, conversation_id, record = outcome
         key = result_key(tenant_id, conversation_id)
         out_path = self.results_dir / f"{tenant_id}__{conversation_id}.json"

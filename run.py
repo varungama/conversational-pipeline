@@ -78,25 +78,10 @@ def run_local(args):
 
     queue = FileQueue(work_dir)
     enqueued = 0
-    sharded = 0
     for source_file in sorted(input_dir.glob("*.json")):
-        try:
-            raw_doc = json.loads(source_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw_doc = None  # enqueue as-is; the worker dead-letters it with the real reason
-        shards = plan_shards(raw_doc)
-        if not shards:
-            queue.enqueue(source_file, cost=estimate_cost(raw_doc))
-        else:
-            for shard in shards:
-                queue.enqueue_task(
-                    f"{source_file.stem}.shard-{shard['index']:04d}-of-{shard['count']:04d}.json",
-                    {"shard_task": {"source_file": source_file.name, "shard": shard, "doc": raw_doc}},
-                    cost=shard["end"] - shard["start"],
-                )
-            sharded += 1
+        queue.enqueue(source_file)
         enqueued += 1
-    logger.info("Enqueued %d conversation file(s) from %s (%d split into shards)", enqueued, input_dir, sharded)
+    logger.info("Enqueued %d conversation file(s) from %s", enqueued, input_dir)
 
     if args.workers <= 1:
         logger.info("Loading sentiment model %s (downloads on first run if not already cached)...",
