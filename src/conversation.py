@@ -1,11 +1,4 @@
-"""Parsing and validation for a single conversation record.
-
-Two kinds of malformation, handled differently:
-  - Whole-record (`turns` missing or not a list): reject the whole record
-    to dead-letter, rather than guess a result.
-  - Turn-level (one bad turn in an otherwise fine list): skip just that
-    turn with a reason, keep scoring the rest.
-"""
+"""Parsing and validation of one conversation: a bad `turns` rejects the record, a bad turn is skipped with a reason."""
 
 from datetime import datetime
 
@@ -27,10 +20,8 @@ def parse_timestamp(value):
 
 
 def validate_turn(raw_turn, index):
-    """Checks one turn object against the required shape. Returns:
-      {"status": "ok", "index", "seq", "role", "ts", "parsed_ts", "text", "has_content"}
-      {"status": "skipped", "index", "reason"}
-    """
+    """Checks one turn; returns {"status": "ok", index, seq, role, ts, parsed_ts, text, has_content}
+    or {"status": "skipped", index, reason}."""
     if not isinstance(raw_turn, dict):
         return {"status": "skipped", "index": index, "reason": "turn_not_an_object"}
 
@@ -66,9 +57,7 @@ def validate_turn(raw_turn, index):
 
 
 def load_conversation(raw_doc):
-    """Validates the whole-record shape and returns one result per turn.
-    Raises ConversationRejected if `turns` is missing/wrongly-typed;
-    individual bad turns are reported as skipped, not raised."""
+    """Returns one validated result per turn; raises ConversationRejected if `turns` is missing or not a list."""
     if not isinstance(raw_doc, dict):
         raise ConversationRejected("record_not_an_object")
 

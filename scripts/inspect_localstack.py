@@ -1,8 +1,4 @@
-"""Read-only look at what --backend aws left in LocalStack: S3 objects and
-the DynamoDB idempotency ledger. Requires `docker compose up -d` running.
-
-    python scripts/inspect_localstack.py
-"""
+"""Read-only look at what --backend aws left in LocalStack (S3 objects, DynamoDB ledger); needs `docker compose up -d`."""
 
 import logging
 import pathlib

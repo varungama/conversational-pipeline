@@ -1,10 +1,6 @@
-"""Proves the SQS/S3/DynamoDB path end to end without Docker or a network
-call: moto intercepts boto3 and fakes each AWS service in-memory, so the
-same client code that would talk to LocalStack (or real AWS - only
-AwsConfig.endpoint_url changes) runs here against a fake. See NOTES.md for
-why this is a substitute for testing against real LocalStack.
-"""
+"""End-to-end SQS/S3/DynamoDB tests on moto (in-memory AWS, no Docker); a stand-in for LocalStack (NOTES.md)."""
 
+import threading
 import time
 import unittest
 
@@ -95,7 +91,7 @@ class TestAwsWorker(unittest.TestCase):
         self._submit("acme", "c-2", doc)
         self._submit("acme", "c-2", doc)  # same conversation, delivered twice
 
-        summary = self.worker.run_once()
+        summary = self.worker.run_once(max_messages=2)  # both copies in one receive
         self.assertEqual(summary["processed"], 1)
         self.assertEqual(summary["skipped_duplicate"], 1)
         self.assertEqual(len(self.results.list_all()), 1)
@@ -131,11 +127,12 @@ class TestAwsWorker(unittest.TestCase):
 
     def test_sharded_conversation_is_merged_into_one_result_equal_to_unsharded(self):
         turns = [{"seq": i, "role": "customer", "ts": f"2026-03-02T09:{i // 60:02d}:{i % 60:02d}Z",
-                  "text": ["GOOD", "BAD", "MEH"][i % 3]} for i in range(120)]
+                  "text": ["GOOD", "BAD", "MEH"][i % 3] + " " * 40} for i in range(120)]
         doc = {"conversation_id": "c-big", "tenant_id": "acme", "channel": "chat", "turns": turns}
         self.conversations.put("acme", "c-big", doc)
         shards = plan_shards(doc)
         self.assertEqual(len(shards), 3)
+        self.shard_store.put_slices("acme", "c-big", doc, shards)
         for shard in shards:
             self.queue.enqueue("acme", "c-big", shard=shard)
 
@@ -156,6 +153,54 @@ class TestAwsWorker(unittest.TestCase):
         self.queue.enqueue("acme", "c-big", shard=shards[0])
         again = self.worker.run_once()
         self.assertEqual(again["skipped_duplicate"], 1)
+        self.assertEqual(len(self.results.list_all()), 1)
+
+    def test_shard_workers_read_only_their_slice_not_the_whole_document(self):
+        turns = [{"seq": i, "role": "customer", "ts": f"2026-03-02T09:{i // 60:02d}:{i % 60:02d}Z",
+                  "text": "GOOD" + " " * 40} for i in range(120)]
+        doc = {"conversation_id": "c-slice", "tenant_id": "acme", "channel": "chat", "turns": turns}
+        self.conversations.put("acme", "c-slice", doc)
+        shards = plan_shards(doc)
+        self.shard_store.put_slices("acme", "c-slice", doc, shards)
+        for shard in shards:
+            self.queue.enqueue("acme", "c-slice", shard=shard)
+
+        full_reads = []
+        original_get = self.conversations.get
+        self.conversations.get = lambda *a: (full_reads.append(a), original_get(*a))[1]
+        while self.queue.approximate_depth() > 0:
+            self.worker.run_once()
+        self.assertEqual(len(full_reads), 1)  # only the shard that merges reads the document
+        self.assertEqual(len(self.results.list_all()), 1)
+
+    def test_slow_task_is_not_redelivered_while_it_is_still_running(self):
+        class SlowScorer(StubScorer):
+            def score(self, text):
+                time.sleep(2.5)  # > the 1s visibility timeout
+                return super().score(text)
+
+        queue = SqsQueue(self.clients, self.queue.queue_url, self.queue.dlq_url,
+                         self.config.visibility_timeout_seconds)
+        worker = AwsWorker(queue, self.conversations, self.results, self.ledger, SlowScorer())
+        doc = {"conversation_id": "c-slow", "tenant_id": "acme", "channel": "chat",
+               "turns": [{"seq": 0, "role": "customer", "ts": "2026-03-02T09:14:00Z", "text": "GOOD"}]}
+        self._submit("acme", "c-slow", doc)
+
+        stolen = []
+        thread = threading.Thread(target=worker.run_once)
+        thread.start()
+        while True:  # wait until the worker really holds the message, or the poller could win the race
+            attrs = self.queue.sqs.get_queue_attributes(
+                QueueUrl=self.queue.queue_url, AttributeNames=["ApproximateNumberOfMessagesNotVisible"])
+            if int(attrs["Attributes"]["ApproximateNumberOfMessagesNotVisible"]) == 1:
+                break
+            time.sleep(0.05)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:  # a second worker polling while the first is mid-task
+            stolen += queue.receive_batch(max_messages=1, wait_time_seconds=0)
+            time.sleep(0.2)
+        thread.join()
+        self.assertEqual(stolen, [])
         self.assertEqual(len(self.results.list_all()), 1)
 
     def test_pointer_message_never_carries_the_transcript(self):

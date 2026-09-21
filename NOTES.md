@@ -15,7 +15,7 @@
 | Idempotency ledger | Single-process safe only | Fixed race across multiple processes (`try_claim`) |
 | Reproducibility | `scored_at` was real time | Fixed `--scored-at`, plus `input_sha256` |
 | Long turns | Truncated at 512 tokens, rest dropped | Sentence-aware chunking + aggregation (§4.1). Schema `1.1` |
-| Uneven work | One model call per turn; whole conversation = one task | Length-sorted batching, sharding, longest-first dispatch, worst-case visibility timeout (§6.1) |
+| Uneven work | One model call per turn; whole conversation = one task | Length-sorted batching, token-cost sharding with S3 slices, longest-first dispatch, visibility heartbeat (§6.1) |
 
 Everything below is the full picture, current state.
 
@@ -35,7 +35,7 @@ python run.py --input data/conversations --output results
 - Python 3.11–3.14. ~650MB disk (model + deps).
 - First run downloads the model (~550MB). Later runs are offline.
 - ~9s model load. ~20s to score 27 sample conversations.
-- Writes only to `queue/` and `results/`. No account, API key, or GPU needed.
+- Writes only to `queue/` and `results/`. No account or API key needed.
 
 AWS backend (needs Docker):
 
@@ -180,7 +180,7 @@ Limits:
 
 ## 6. Scale & cost
 
-Measured on one CPU core, no GPU, single-conversation-set benchmark.
+Measured on one CPU core, single-conversation-set benchmark.
 
 | | distilbert (66M, English only) | roberta (278M, multilingual, default) |
 | --- | --- | --- |
@@ -192,14 +192,14 @@ Measured on one CPU core, no GPU, single-conversation-set benchmark.
 | Cost / million conversations, spot | ~\$0.52–0.69 | ~\$2.45–3.25 |
 
 - Bottleneck is model inference, not I/O. A forward pass is ~13ms (distilbert) / ~61ms (roberta).
-- Batching (`batch_size=32`) measured *slower* than unbatched, on distilbert. Padding waste from mixed turn lengths. That measurement was of unsorted batches; the pipeline now sorts by length first (§6.1). **Not re-measured** - the throughput numbers in this table are still the old unbatched ones.
+- Batching (`batch_size=32`) measured *slower* than unbatched, on distilbert. Padding waste from mixed turn lengths. That measurement was of unsorted batches. Length-sorted, token-capped batching is now in and gives 1.1-1.2x on CPU (§6.1); the throughput numbers in this table are still the old unbatched ones.
 - A same-day, back-to-back comparison (separate ad-hoc script, not shipped in this repo) put the gap at 6.4x, not 4.7x — the two headline numbers above were measured on different days. Same-day table: distilbert 96.3 t/s, roberta 15.1 t/s.
 
 **What breaks first at 10x** (2M/day → 20M/day):
 1. Worker fleet size — solved by autoscaling.
 2. The idempotency ledger. It rewrites the whole seen-set on every write. `O(n)`. This is the real bottleneck, before fleet size is.
 
-**Scaling levers, by effort:** more workers (done) → length-sorted batching + sharding (built, §6.1; throughput gain not measured) → ONNX + INT8 quantization (estimated 2–4x, not measured) → temporary GPU for the backfill only.
+**Scaling levers, by effort:** more workers (done) → length-sorted batching + sharding (built, §6.1; batching measured 1.1-1.2x on CPU) → ONNX + INT8 quantization (estimated 2–4x, not measured).
 
 **Cost, as \$/month and \$/backfill (assumptions stated, not measured):**
 
@@ -230,29 +230,79 @@ Backfill, 500M conversations, one-time (cost/million × 500):
 
 ### 6.1 Uneven work: 1 turn vs 200 turns (AWS backend)
 
-Cost per conversation varies ~200x (c-000028 has 200 turns). Two problems: throughput inside a conversation, and balance across workers.
+Cost per conversation varies ~200x (c-000028 has 200 turns, the median 5). CPU only, no GPU.
 
-| Fix | What it does | Where |
+| Step | What it does | Where |
 | --- | --- | --- |
-| Batch turns | One `score_batch` call per conversation instead of one model call per turn. Scorers without `score_batch` fall back to per-turn. | `scoring.score_turns` |
-| Sort by length | Pool all chunks, sort longest-first, cut batches of `BATCH_SIZE=32`, scatter results back by index. Removes the padding waste behind the old "batching was slower" result. | `SentimentScorer.score_batch` |
-| Longest-first dispatch | `run.py` sends tasks to SQS in descending cost order (cost = turn count). Standard SQS is only best-effort ordered, so this is a hint, not a guarantee. | `run.py` |
-| Shard huge conversations | Over `SHARD_MAX_TURNS=50` turns, the conversation becomes contiguous shard messages (200 → 4×50). Each shard scores its slice and parks `{turn: score}` in S3 (`shards/`); the last to land merges via `evaluate(..., turn_scores=)`. Ledger `try_claim` covers a simultaneous finish; a redelivered shard after completion is skipped via `ledger.has`. | `sharding.py`, `S3ShardStore`, `aws/worker.py` |
-| Visibility timeout for worst case | A worker's batch of 5 messages is all invisible but processed serially, so the last must outlive the batch: `ceil(5 x 6s) = 30s` (was fixed 5s). Too short: SQS redelivers in-flight work and burns `maxReceiveCount`, sending healthy messages to the DLQ. Sharding is what bounds the worst-case task. `--aws-drain-timeout` 60s → 150s so 3 redrives fit. | `aws/config.py` |
+| Cost estimate | ms ≈ 8 per turn + 4 per token (model tokenizer); fallback 12 per turn + 1 per char. Fit R²: turns only 0.849, +chars 0.983, **+tokens 0.988** (82 points). | `sharding.py`, `scripts/fit_cost_model.py` |
+| Shard plan | Cost over `SHARD_MAX_COST=2500` (~2.5s): fewest shards under a **hard cap**, rebalanced to near-equal. A single turn over the cap gets its own shard. | `sharding.plan_shards` |
+| Slices | Each shard's turns are written once to S3 `slices/`; a shard worker reads only its slice (500 shards: ~1.1 GB of reads becomes ~2.3 MB). | `S3ShardStore` |
+| Longest-first | `run.py` enqueues by descending cost (SQS is best-effort ordered, so a hint). | `run.py` |
+| Batching | One `score_batch` per task: chunks sorted by length, at most 32 items and 512 padded tokens per batch. | `SentimentScorer.score_batch` |
+| Merge | Each shard parks `{turn: score}` in S3 `shards/`; the last to land calls `evaluate(..., turn_scores=)`. Ledger `try_claim` and `has` cover duplicates. | `aws/worker.py` |
+| One message per receive | `RECEIVE_BATCH_SIZE=1`; a worker holding several hoards the biggest tasks. | `aws/config.py` |
+| Visibility heartbeat | `keep_alive` re-extends the timeout every third of it while a task runs. The 6s base timeout only bounds a crashed worker. | `SqsQueue.keep_alive` |
 
 Env overrides: `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTIMENT_WORST_TASK_SECONDS`.
 
-**Verified (VADER fallback; real model not installed here):**
-- 59 tests pass, including moto shard-merge (sharded result equals unsharded; redelivered shard is a no-op).
-- Real LocalStack: 25 processed, 1 duplicate skipped, 3 shards scored and merged, 2 dead-lettered after 3 retries each, inside the 150s drain. Rerun on the same ledger: 0 processed, 29 skipped.
+**Measured** (real roberta, 12-core CPU, `scripts/benchmark.py`):
 
-**Not done / limits**
-- Speedups are **not benchmarked**. `BATCH_SIZE`, `SHARD_MAX_TURNS` and the 6s worst-case task are first guesses (50 turns at 16 turns/s, doubled). If a task can exceed 6s, add a `ChangeMessageVisibility` heartbeat.
-- Turn count ignores turn length; one huge chunked turn costs more than it says.
-- A dead-lettered shard reaches the DLQ; the errors report names it, but its conversation gets no result.
-- Shard partials are never deleted; add an S3 lifecycle expiry on `shards/`.
-- With the real model, batching padding can move a score in the 4th decimal versus pre-batching runs.
-- Local backend (`--backend local`) is unchanged by this work: no sharding or cost ordering. It does use the batched scoring path.
+| Item | Result |
+| --- | --- |
+| Batching | 27.2 vs 21.8 turns/s on c-000028 (1.25x); 17.7 vs 15.8 on all turns (1.12x) |
+| `MAX_BATCH_TOKENS` | 128-1024 within ~7%; 2048 → 14.7, 4096 → 11.0, unlimited → 4.1 turns/s. 512 chosen |
+| Cost model | Measured 1.11 ms per cost unit on unsharded tasks (1.00 = perfect): ~11% underestimate |
+| Worst task | 7.35s unsharded (c-000028) → **3.28s** at cap 2500 (c-000027, one unsplittable 854-token turn) |
+
+| `SHARD_MAX_COST` | Tasks | Largest | Extra work | Makespan, 4 workers | 8 workers |
+| --- | --- | --- | --- | --- | --- |
+| 1200 | 32 | 3.28s | +12% | 5.7s | 3.3s |
+| **2500** | 29 | 3.28s | +7% | 5.4s | 3.3s |
+| 5000 | 26 | 3.94s | +2% | 5.3s | 3.9s |
+
+**Shard plan on the shipped data** (cap 2500; costs in ~ms, tokens vs the character fallback):
+
+| Conversation | Shard | Turns | Cost (tokens) | Cost (chars) |
+| --- | --- | --- | --- | --- |
+| c-000027 (3 turns) | 0 | 0 | **3,424** | **3,950** |
+| | 1 | 1–2 | 148 | 158 |
+| c-000028 (200 turns) | 0 | 0–49 | 1,928 | 2,090 |
+| | 1 | 50–99 | 1,912 | 2,098 |
+| | 2 | 100–149 | 1,928 | 2,090 |
+| | 3 | 150–199 | 1,912 | 2,098 |
+
+- c-000027 turn 0 (~4,000 characters) exceeds the cap alone and cannot be split, so it gets its own shard (the 3.7s case).
+- c-000028 costs 7,680 (tokens): at least 4 shards, rebalanced to within ~1% of each other, all under the cap.
+- The other 23 conversations cost under 2,500 and stay whole. 28 files → 26 whole tasks + 6 shards = **32 tasks**.
+
+Simulated makespan from those task times:
+
+| Workers | Unsharded | Longest-first | + shards ≤2500 | Lower bound |
+| --- | --- | --- | --- | --- |
+| 1 | 20.2s | 20.2s | 21.5s | 20.2s |
+| 2 | 13.6s | 10.2s | 10.8s | 10.1s |
+| 4 | 10.1s | 7.3s | 5.4s | 5.1s |
+| 8 | 8.4s | 7.3s | 3.3s | 2.5s |
+
+**Real 4-worker run on LocalStack** (3 torch threads each; measured before the token cost and heartbeat, not re-run):
+
+| Receive batch | Unsharded | Longest-first | Sharded + longest-first |
+| --- | --- | --- | --- |
+| 1 | 23.9s | 17.4s (1.37x) | **15.8s (1.51x)** |
+| 5 | 22.0s | 28.2s (0.78x) | 26.0s (0.84x) |
+
+With a batch of 5, one worker grabs the 5 biggest tasks and becomes the tail, hence the default of 1 (cost: ~1 extra SQS request per task, negligible).
+
+**Scores are not bit-identical to per-turn or unsharded scoring.** Batch composition changes padding: 73/319 turn scores differ from the pre-batching run (max 0.004), sharded c-000028 differs from unsharded by up to ~0.002. No labels changed. Deterministic for a fixed input and shard plan.
+
+**Verified:** 65 tests pass (stub scorers, moto). Real model: local run 25 processed, 1 duplicate, 2 dead-lettered. Real LocalStack: same counts, 2 dead-lettered after 3 retries, 4 shard partials merged.
+
+**Limits**
+- One machine, 25 conversations, one big one: re-run `scripts/fit_cost_model.py` and `scripts/benchmark.py` on the production CPU type.
+- A single turn over the cap cannot be split; the fix for very large turns is chunk-level shards.
+- A dead-lettered shard reaches the DLQ; that conversation gets no result.
+- `slices/` and `shards/` are never deleted: add an S3 lifecycle expiry on both.
+- The local backend has batched scoring only: no sharding or cost ordering.
 
 ---
 
@@ -342,9 +392,10 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 1. Continuous poll loop instead of the current bounded drain-and-exit.
 2. CloudWatch alarm on DLQ depth, wired to actually page someone.
 3. A standalone "volatility" metric, if the product ever needs to tell "flat" apart from "chaotic but flat."
-4. Benchmark length-sorted batching and pick `BATCH_SIZE` / `SHARD_MAX_TURNS` from data (both are first guesses).
+4. Re-run `scripts/fit_cost_model.py` and `scripts/benchmark.py` on the production CPU type (§6.1).
 5. ONNX Runtime + INT8 quantization — highest-value unmeasured lever, given roberta's cost.
 6. A human-labeled, real support-transcript set, for an actual accuracy number.
 7. Sarcasm / double-negation handling — still broken on both models tried so far.
 8. Retries with backoff on the local backend (AWS backend already gets this from SQS).
 9. Measure chunking's throughput cost on a set of genuinely long, real transcripts (behavior is verified, §4.1; cost is not).
+10. Chunk-level shards for very large single turns; S3 lifecycle expiry on `slices/` and `shards/`.

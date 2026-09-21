@@ -1,27 +1,5 @@
-"""Turn-level sentiment scoring: a transformer model, with a rule-based lexicon VADER fallback.
-
-Every score is reported the same shape regardless of which backend produced
-it, so the rest of the pipeline never has to know which one ran:
-
-    {"label": "positive" | "neutral" | "negative",
-     "score": signed value in [-1, 1],
-     "confidence": value in [0, 1]}
-
-Two transformer models are registered in MODEL_REGISTRY, selectable via
-`--model` on run.py (NOTES.md Section 5.1 has a measured cost/throughput
-comparison between them):
-
-- `roberta` (clapAI/roberta-base-multilingual-sentiment, XLM-RoBERTa-base,
-  278M params) - the current default. A genuine 3-way classifier -
-  positive/neutral/negative - trained across 16+ languages including French
-  and Japanese, so its per-turn `label` comes directly from the model's own
-  prediction rather than a threshold we impose.
-- `distilbert` (distilbert-base-uncased-finetuned-sst-2-english, 66M params)
-  - the original backend. English-only and strictly binary
-  (positive/negative, no native neutral class) - see NOTES.md Section 5.2
-  for the measured French/Japanese failure mode this model has and
-  `roberta` fixes, at a throughput cost (NOTES.md Section 5.1).
-"""
+"""Turn-level sentiment: a transformer (default `roberta`, 3-way multilingual; `distilbert`, English binary) with a VADER fallback.
+Every backend returns {"label", "score" in [-1, 1], "confidence" in [0, 1]}; model comparison in NOTES.md 5.1-5.2."""
 
 import logging
 import re
@@ -43,17 +21,12 @@ MODEL_REGISTRY = {
 DEFAULT_MODEL_KEY = "roberta"
 NEUTRAL_THRESHOLD = 0.2
 
-# The model's window is 512 tokens including the <s>/</s> special tokens.
-# Text longer than this used to be silently truncated, dropping whatever
-# came after the cutoff - see `SentimentScorer.score` for the chunking that
-# replaces that.
+# Model window is 512 tokens including special tokens; longer text is chunked, not truncated.
 MAX_MODEL_TOKENS = 512
 SPECIAL_TOKEN_BUDGET = 2
 CHUNK_TOKEN_LIMIT = MAX_MODEL_TOKENS - SPECIAL_TOKEN_BUDGET
 
-# Sentence boundaries, zero-width so no characters are lost: after a
-# Japanese/fullwidth terminator (no space follows in Japanese), after an
-# ASCII terminator that is followed by whitespace, and after a newline.
+# Zero-width sentence boundaries: after 。！？, after .!? followed by whitespace, and after a newline.
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？])|(?<=[.!?])(?=\s)|(?<=\n)")
 
 
@@ -73,14 +46,8 @@ def _hard_split(piece: str, count_tokens, limit: int) -> list[str]:
 
 
 def chunk_text(text: str, count_tokens, limit: int = CHUNK_TOKEN_LIMIT) -> list[tuple[str, int]]:
-    """Packs whole sentences greedily into chunks of at most `limit` tokens.
-
-    Returns [(chunk_text, token_count), ...]. Sentence-aware so a negation
-    is never separated from what it negates ("not" / "good"); greedy
-    left-to-right with no randomness so the same text always chunks the same
-    way (byte-identical reruns). Text that already fits returns one chunk
-    that is the original text, untouched.
-    """
+    """Packs whole sentences greedily into chunks of at most `limit` tokens; returns [(chunk, token_count)].
+    Sentence-aware and deterministic; text that fits comes back as one untouched chunk."""
     total = count_tokens(text)
     if total <= limit:
         return [(text, total)]
@@ -105,26 +72,46 @@ def chunk_text(text: str, count_tokens, limit: int = CHUNK_TOKEN_LIMIT) -> list[
 
 
 def aggregate_probs(chunk_probs: list[tuple[dict, int]]) -> dict:
-    """Token-weighted mean of per-class probabilities across chunks. A
-    longer chunk says more of the text, so it counts for more. Repeating one
-    sentence N times leaves the mean unchanged."""
+    """Token-weighted mean of per-class probabilities across chunks (longer chunks count for more)."""
     total = sum(weight for _, weight in chunk_probs) or 1
     classes = {label for probs, _ in chunk_probs for label in probs}
     return {c: sum(p.get(c, 0.0) * w for p, w in chunk_probs) / total for c in classes}
 
 
-# Chunks per forward pass. Batches are cut from a length-sorted list (see
-# `length_sorted_batches`), so padding to the longest item in a batch wastes
-# little; unsorted, one long turn pads all 31 of its neighbours to its length.
+# Caps on one forward pass: batches are limited by padded tokens (items x longest) as well as item count,
+# or a few ~400-token chunks pad 30 short ones to 400 (measured: 56s for one batch).
 BATCH_SIZE = 32
+MAX_BATCH_TOKENS = 512
 
 
-def length_sorted_batches(lengths: list[int], batch_size: int = BATCH_SIZE) -> list[list[int]]:
-    """Groups item indices into batches of similar length: longest first,
-    ties broken by original index so the grouping is deterministic. Callers
-    scatter results back by index, so input order is preserved."""
+def length_sorted_batches(lengths: list[int], batch_size: int = BATCH_SIZE,
+                          max_tokens: int = MAX_BATCH_TOKENS) -> list[list[int]]:
+    """Groups item indices into length-sorted batches capped by `batch_size` and padded size (items x longest) `max_tokens`;
+    ties break by index, and an over-budget item gets its own batch."""
     order = sorted(range(len(lengths)), key=lambda i: (-lengths[i], i))
-    return [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
+    batches, current = [], []
+    for i in order:
+        # `order` is longest-first, so the batch's first item sets its padded width
+        if current and (len(current) >= batch_size or (len(current) + 1) * lengths[current[0]] > max_tokens):
+            batches.append(current)
+            current = []
+        current.append(i)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def load_token_counter(model_key: str = DEFAULT_MODEL_KEY):
+    """A str -> token-count function from the model's own tokenizer (model not loaded), or None so callers use characters."""
+    target = MODEL_REGISTRY[model_key]
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(target["model_name"], revision=target["revision"])
+    except Exception as exc:
+        logger.warning("Tokenizer unavailable (%s); estimating cost from characters instead.", exc)
+        return None
+    return lambda text: len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
 
 class SentimentScorer:
@@ -168,22 +155,8 @@ class SentimentScorer:
         return self.score_batch([text])[0]
 
     def score_batch(self, texts: list[str]) -> list[dict]:
-        """Scores many texts at once; returns one result per text, in order.
-        Assumes each text is a non-empty string - the caller is responsible
-        for deciding whether a turn has content worth scoring at all.
-
-        Text over the model's window is split into sentence-aware chunks,
-        each chunk scored, and the per-class probabilities averaged
-        (token-weighted) before the label / signed score / confidence are
-        derived - so those keep exactly the meaning they have for short
-        text. `n_chunks` reports how many pieces were scored (1 for text
-        that fits, and always 1 for the VADER fallback, which has no
-        window limit).
-
-        All chunks from all texts are pooled and run through the model in
-        length-sorted batches (`length_sorted_batches`), then regrouped per
-        text. This lives here, not in src/scoring.py, so both workers pick
-        it up unchanged."""
+        """Scores many texts at once, one result per text in order (`n_chunks` = pieces scored; texts must be non-empty).
+        Long text is chunked, chunk probabilities averaged, and all chunks batched together by length."""
         if self.backend_name == "transformer":
             outcomes = self._score_batch_with_transformer(texts)
         else:
@@ -205,18 +178,13 @@ class SentimentScorer:
         """Class probabilities for each chunk, in input order. `lengths` are
         the chunks' token counts, used only to group similar lengths."""
         probs = [None] * len(chunks)
-        for batch in length_sorted_batches(lengths):
+        for batch in length_sorted_batches(lengths, BATCH_SIZE, MAX_BATCH_TOKENS):  # module globals, read at call time
             results = self._pipeline([chunks[i] for i in batch], top_k=None, batch_size=len(batch))
-            # A list input returns one list of {label, score} per item, but
-            # guard against the flat single-example shape some pipeline
-            # versions use.
+            # Some pipeline versions return a flat single-example list; wrap it.
             if results and isinstance(results[0], dict):
                 results = [results]
             for i, result in zip(batch, results):
-                # Lower-cased because the two registered models disagree on
-                # casing (roberta: "positive"/"neutral"/"negative",
-                # distilbert: "POSITIVE"/"NEGATIVE") - normalising here is
-                # what lets `probs.get("positive")` below work for both.
+                # Lower-cased: roberta returns "positive", distilbert "POSITIVE".
                 probs[i] = {r["label"].lower(): float(r["score"]) for r in result}
         return probs
 

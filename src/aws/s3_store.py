@@ -1,16 +1,9 @@
-"""Where the bytes actually live on AWS.
-
-Raw transcripts in one bucket, scored results in another. The SQS message
-only ever carries a pointer (tenant_id + conversation_id), never the
-transcript - SQS caps messages at 256KB, and pointer-passing costs nothing
-extra to build now, before a bigger transcript makes that a problem
-(NOTES.md Section 6).
-"""
+"""Where bytes live on AWS: transcripts and results in separate buckets; SQS messages carry only pointers."""
 
 import json
 
 from src.aws.clients import AwsClients
-from src.sharding import decode_partial, encode_partial
+from src.sharding import decode_partial, encode_partial, slice_turns
 
 
 def _key(tenant_id: str, conversation_id: str) -> str:
@@ -38,11 +31,8 @@ class S3ConversationStore:
 
 
 class S3ShardStore:
-    """Partial per-turn scores of a sharded conversation, parked until every
-    shard has landed. Same interface as the local src/shard_store.py.
-    Lives in the conversations bucket under `shards/` - not the results
-    bucket, whose `list_all` would return them as results. Nothing deletes
-    them: put an S3 lifecycle expiry on the `shards/` prefix."""
+    """Sharded-conversation data in the conversations bucket: `slices/` (each shard's turns, written once) and `shards/` (partial scores).
+    Nothing deletes them; add an S3 lifecycle expiry on both prefixes."""
 
     def __init__(self, clients: AwsClients, bucket: str):
         self.s3 = clients.s3
@@ -51,6 +41,24 @@ class S3ShardStore:
     @staticmethod
     def _prefix(tenant_id: str, conversation_id: str) -> str:
         return f"shards/{tenant_id}/{conversation_id}/"
+
+    @staticmethod
+    def _slice_key(tenant_id: str, conversation_id: str, index: int) -> str:
+        return f"slices/{tenant_id}/{conversation_id}/{index:05d}.json"
+
+    def put_slices(self, tenant_id: str, conversation_id: str, raw_doc: dict, shards: list):
+        """Stores each shard's turns. Call before enqueueing the shards."""
+        for shard in shards:
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=self._slice_key(tenant_id, conversation_id, shard["index"]),
+                Body=json.dumps(slice_turns(raw_doc, shard), ensure_ascii=False).encode("utf-8"),
+                ContentType="application/json",
+            )
+
+    def get_slice(self, tenant_id: str, conversation_id: str, index: int) -> list:
+        obj = self.s3.get_object(Bucket=self.bucket, Key=self._slice_key(tenant_id, conversation_id, index))
+        return json.loads(obj["Body"].read().decode("utf-8"))
 
     def put(self, tenant_id: str, conversation_id: str, index: int, scores: dict):
         self.s3.put_object(
@@ -95,9 +103,7 @@ class S3ResultStore:
         )
 
     def list_all(self) -> list:
-        """Returns every scored record in the bucket. Fine for a demo-sized
-        run; at real volume, query through whatever indexes this bucket
-        (Athena, a proper database) instead of paging through objects."""
+        """Returns every scored record; fine for a demo, use an index (Athena, a database) at real volume."""
         records = []
         paginator = self.s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket):

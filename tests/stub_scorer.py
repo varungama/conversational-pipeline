@@ -1,7 +1,4 @@
-"""A fake scorer shared by both test suites so neither loads the real
-model. Scores a fixed vocabulary of marker words for deterministic
-"sentiment" in tests.
-"""
+"""Fake scorer shared by both test suites: fixed marker words give deterministic sentiment."""
 
 
 class StubScorer:

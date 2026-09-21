@@ -1,14 +1,5 @@
-"""The AWS-shaped worker: same scoring logic as src/worker.py (both call
-into src/scoring.py), different plumbing - SQS instead of a directory,
-S3 instead of local JSON files, DynamoDB instead of a JSON ledger.
-
-Failure handling deliberately does *not* mirror the local worker's
-"dead-letter immediately" behaviour. Here, an unprocessable message is
-simply never deleted (never ack'd); SQS's own visibility timeout makes it
-reappear for another attempt, and after `max_receive_count` attempts the
-queue's RedrivePolicy moves it to the DLQ with no application code
-involved. See sqs_queue.py for why.
-"""
+"""AWS worker: same scoring as src/worker.py (via src/scoring.py) over SQS/S3/DynamoDB.
+Failures are never acked: SQS redelivers them and moves them to the DLQ after max_receive_count."""
 
 import logging
 
@@ -45,25 +36,12 @@ class AwsWorker:
         # Same byte-identical-rerun knob as the local Worker - see
         # src/scoring.py and src/worker.py.
         self.scored_at = scored_at
-        # Same "equal" vs "confidence" knob as the local Worker - kept in
-        # sync so the two transports cannot silently diverge on metrics
-        # either, same as everything else routed through src/scoring.py.
+        # Same equal-vs-confidence knob as the local Worker, so both transports compute identical metrics.
         self.weighting = weighting
 
     def run_once(self, max_messages: int = RECEIVE_BATCH_SIZE) -> dict:
-        """Receives and processes one batch. Returns counts by outcome.
-
-        `left_for_retry` messages are not a bug - they are unprocessable
-        (or hit an unexpected exception) and were deliberately not deleted,
-        so SQS will redeliver them. Call this repeatedly (see run.py) to
-        drain a queue; a message only truly disappears (to done or to the
-        DLQ) after enough passes.
-
-        `max_messages` must be paired with a visibility timeout that covers
-        that many worst-case tasks in a row - see src/aws/config.py.
-        `shards_scored` counts shard messages that only parked a partial;
-        the one that completes a conversation counts as `processed`.
-        """
+        """Processes one receive batch; returns counts by outcome (`left_for_retry` = left un-acked for SQS to redeliver).
+        `shards_scored` = shards that only parked a partial; the merging shard counts as `processed`."""
         summary = {"processed": 0, "skipped_duplicate": 0, "left_for_retry": 0, "shards_scored": 0}
         for message in self.queue.receive_batch(max_messages=max_messages):
             outcome = self._process_one(message)
@@ -71,6 +49,12 @@ class AwsWorker:
         return summary
 
     def _process_one(self, message: Message) -> str:
+        # Held invisible for as long as this takes, so a slow task is never
+        # redelivered mid-flight (see SqsQueue.keep_alive).
+        with self.queue.keep_alive(message):
+            return self._handle(message)
+
+    def _handle(self, message: Message) -> str:
         tenant_id = message.body.get("tenant_id")
         conversation_id = message.body.get("conversation_id")
         if not tenant_id or not conversation_id:
@@ -78,15 +62,7 @@ class AwsWorker:
             return "left_for_retry"
 
         key = result_key(tenant_id, conversation_id)
-        source_ref = f"{tenant_id}/{conversation_id}.json"
-
         shard = message.body.get("shard")
-
-        try:
-            raw_doc = self.conversation_store.get(tenant_id, conversation_id)
-        except Exception:
-            logger.exception("Could not fetch %s from S3 - will retry / eventually DLQ.", source_ref)
-            return "left_for_retry"
 
         turn_scores = None
         if shard:
@@ -95,8 +71,11 @@ class AwsWorker:
                 self.queue.ack(message)
                 return "skipped_duplicate"
             try:
+                # Only this shard's slice is read; the whole document is
+                # fetched below, once per conversation, by the merging shard.
+                turns = self.shard_store.get_slice(tenant_id, conversation_id, shard["index"])
                 self.shard_store.put(tenant_id, conversation_id, shard["index"],
-                                     score_shard(raw_doc, shard, self.scorer))
+                                     score_shard(turns, shard, self.scorer))
                 if len(self.shard_store.indexes(tenant_id, conversation_id)) < shard["count"]:
                     self.queue.ack(message)  # partial is durable; the last shard to land does the merge
                     return "shards_scored"
@@ -105,6 +84,20 @@ class AwsWorker:
                 logger.exception("Unexpected error scoring shard %s of %s - will retry / eventually DLQ.",
                                  shard.get("index"), key)
                 return "left_for_retry"
+
+        return self._finish(message, tenant_id, conversation_id, turn_scores)
+
+    def _finish(self, message: Message, tenant_id: str, conversation_id: str, turn_scores) -> str:
+        """Builds and stores the result record. `turn_scores` is the merged
+        partials of a sharded conversation, or None to score it whole here."""
+        key = result_key(tenant_id, conversation_id)
+        source_ref = f"{tenant_id}/{conversation_id}.json"
+
+        try:
+            raw_doc = self.conversation_store.get(tenant_id, conversation_id)
+        except Exception:
+            logger.exception("Could not fetch %s from S3 - will retry / eventually DLQ.", source_ref)
+            return "left_for_retry"
 
         try:
             outcome = evaluate(raw_doc, self.scorer, source_ref=source_ref, scored_at=self.scored_at,
@@ -130,11 +123,7 @@ class AwsWorker:
         return "processed"
 
     def drain_dead_letters(self) -> list:
-        """Harvests whatever has landed in the DLQ so far. Each entry only
-        carries what SQS actually knows (the pointer) - the specific reason
-        lives in the worker logs from each failed attempt, not on the
-        message itself. Contrast with the local dead_letter/*.reason.txt
-        file, which the local worker writes by hand."""
+        """Harvests the DLQ; entries carry only the pointer, since the failure reasons are in the worker logs."""
         dead_letters = []
         while True:
             batch = self.queue.receive_dead_letters()

@@ -1,4 +1,5 @@
-# LocalStack container emulating SQS/S3/DynamoDB: docker compose up -d, then python run.py --backend aws.
+# One LocalStack container emulating SQS, S3 and DynamoDB (needs Docker): docker compose up -d,
+# then python run.py --backend aws. The same boto3 code targets it via AwsConfig.endpoint_url (NOTES.md 6).
 services:
   localstack:
     image: localstack/localstack:3

@@ -1,20 +1,5 @@
-"""The worker: claims one conversation file at a time from the queue,
-scores it, and writes a durable result. Safe to run as more than one
-process against the same queue directory (see run.py's `--workers`) - two
-layers make that true:
-
-  - src/queue_store.py's atomic rename stops two workers claiming the same
-    *file* twice.
-  - src/result_index.py's `try_claim` stops two workers both scoring the
-    same *conversation_id* to completion when it arrives as two different
-    files (the shipped duplicate-delivery fixture, or two files racing
-    across two processes) - the file-level claim above cannot catch that on
-    its own, since each file is a distinct claim target.
-
-The actual validate-and-score logic lives in src/scoring.py, shared with
-the AWS (SQS/S3/DynamoDB) worker in src/aws/worker.py, so the two
-transports can never quietly diverge in what a "correct" result looks like.
-"""
+"""Local worker: claims one file at a time, scores it, writes a result; safe with several processes (`--workers`).
+Atomic rename stops double file claims; result_index.try_claim stops double scoring of one conversation_id."""
 
 import json
 import logging
@@ -37,9 +22,7 @@ class Worker:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.scorer = scorer
         self.index = ResultIndex(results_dir / "index.json")
-        # Overrides every record's `scored_at` when set - see src/scoring.py.
-        # Used to make a rerun over unchanged input byte-identical to a
-        # prior run, instead of differing only in real wall-clock time.
+        # Overrides every record's `scored_at` for byte-identical reruns (see src/scoring.py).
         self.scored_at = scored_at
         # "equal" or "confidence" - see src/metrics.py, compute_overall_sentiment.
         self.weighting = weighting
@@ -72,12 +55,7 @@ class Worker:
             self.queue.mark_done(path)
             return "skipped_duplicate"
 
-        # A conversation that parses fine can still make the model itself
-        # throw on some input we did not anticipate (an unusual encoding, a
-        # tokenizer edge case). One conversation's bad luck should not take
-        # the rest of the batch down with it, so this is caught here and
-        # dead-lettered like any other unprocessable record, and the loop
-        # in run_once keeps going.
+        # The model can throw on unforeseen input; dead-letter that conversation instead of failing the batch.
         try:
             outcome = evaluate(raw_doc, self.scorer, source_ref=path.name, scored_at=self.scored_at,
                                 weighting=self.weighting)
@@ -95,12 +73,8 @@ class Worker:
         key = result_key(tenant_id, conversation_id)
         out_path = self.results_dir / f"{tenant_id}__{conversation_id}.json"
 
-        # The pre-check above is only an optimisation (skip re-inference for
-        # an *obvious* duplicate); this is the real mutual-exclusion point -
-        # with multiple worker processes racing (run.py --workers), two of
-        # them can both fail the pre-check and both score the same
-        # conversation, but only one of them wins try_claim and gets to
-        # persist a result. See src/result_index.py.
+        # The earlier check is only an optimisation; try_claim is the real mutual exclusion,
+        # so when worker processes race only one persists a result.
         if not self.index.try_claim(key, out_path.name):
             logger.info("Duplicate delivery for %s::%s (source file %s) - skipping.",
                         tenant_id, conversation_id, path.name)

@@ -1,63 +1,91 @@
-"""Splitting one huge conversation into independently schedulable shards.
-
-Conversation cost is wildly uneven (a 200-turn conversation is ~200x a
-1-turn one). Longest-first dispatch alone cannot fix that: if the single
-biggest job is bigger than a worker's fair share of the whole run, one
-worker is still the tail. Sharding caps the size of any one task.
-
-Turns are scored independently of each other (a turn's score depends only on
-its own text), so a shard is just "score turns [start, end)" and the result
-is a partial map of `turn index -> score`. Once every shard's partial is
-present, whoever finished last assembles the normal result record with
-`scoring.evaluate(..., turn_scores=merged)` - the same code path, so a
-sharded conversation produces exactly the record an unsharded one would.
-
-`cost` everywhere in this module means turn count: a cheap proxy that needs
-no tokenizer. It ignores turn length (a very long turn is chunked and
-batched inside the scorer instead).
-"""
-
-import math
+"""Splits a huge conversation into shards scored independently (turns are independent) and merged by scoring.evaluate.
+Cost (~ms) = 8/turn + 4/token (fit: scripts/fit_cost_model.py, R2 98.8%), or 12/turn + 1/char without a tokenizer."""
 
 from src import conversation as conv
 from src.scoring import extract_identity, score_turns
 
-# One shard is at most this many turns. Also the worst-case task size that
-# the SQS visibility timeout is sized against (src/aws/config.py).
-SHARD_MAX_TURNS = 50
+COST_PER_TURN = 8    # ~ms of fixed work per turn (fitted: 7.9 ms)
+COST_PER_TOKEN = 4   # ~ms per token of text      (fitted: 4.05 ms)
+# Fallback when no tokenizer is available (fitted with a 12.5 ms per turn: 12.5 + 0.88/char)
+COST_PER_TURN_CHARS = 12
+COST_PER_CHAR = 1
+
+# Max cost per shard (~2.5s), also what the visibility timeout is sized against;
+# a single turn bigger than this cannot be split and gets its own shard.
+SHARD_MAX_COST = 2500
 
 
-def estimate_cost(raw_doc) -> int:
+def turn_cost(raw_turn, count_tokens=None) -> int:
+    """`count_tokens`, if given, is a str -> int function (the model's
+    tokenizer); otherwise the text's length in characters is used."""
+    text = raw_turn.get("text") if isinstance(raw_turn, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return COST_PER_TURN if count_tokens else COST_PER_TURN_CHARS
+    if count_tokens:
+        return COST_PER_TURN + COST_PER_TOKEN * count_tokens(text)
+    return COST_PER_TURN_CHARS + COST_PER_CHAR * len(text)
+
+
+def estimate_cost(raw_doc, count_tokens=None) -> int:
     """Relative cost of scoring this document. Malformed docs cost 1 - they
     are rejected quickly."""
     turns = raw_doc.get("turns") if isinstance(raw_doc, dict) else None
-    return max(1, len(turns)) if isinstance(turns, list) else 1
+    if not isinstance(turns, list):
+        return 1
+    return max(1, sum(turn_cost(t, count_tokens) for t in turns))
 
 
-def plan_shards(raw_doc, max_turns: int = SHARD_MAX_TURNS) -> list[dict]:
-    """Returns [] if the conversation should be processed whole, else one
-    descriptor per shard: {"index", "count", "start", "end"} over the raw
-    `turns` list, contiguous, near-equal size, covering every turn once.
+def _greedy_ranges(costs: list, cap: int) -> list:
+    """Contiguous (start, end, cost) ranges closed before passing `cap`; an oversized turn gets its own (fewest ranges)."""
+    ranges, start, acc = [], 0, 0
+    for i, cost in enumerate(costs):
+        if acc and acc + cost > cap:
+            ranges.append((start, i, acc))
+            start, acc = i, 0
+        acc += cost
+    ranges.append((start, len(costs), acc))
+    return ranges
 
-    Only well-formed, identifiable conversations are sharded; anything else
-    goes through the normal whole-record path so it dead-letters with the
-    usual reason."""
+
+def plan_shards(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=None) -> list[dict]:
+    """Returns [] to process whole, else shard descriptors {"index", "count", "start", "end", "cost"} covering every turn once.
+    `max_cost` is a hard cap (except a single oversized turn); fewest shards, then rebalanced near-equal. Malformed docs are not sharded."""
     tenant_id, conversation_id = extract_identity(raw_doc)
     if not tenant_id or not conversation_id:
         return []
     turns = raw_doc.get("turns")
-    if not isinstance(turns, list) or len(turns) <= max_turns:
+    if not isinstance(turns, list):
         return []
-    count = math.ceil(len(turns) / max_turns)
-    bounds = [i * len(turns) // count for i in range(count + 1)]
-    return [{"index": i, "count": count, "start": bounds[i], "end": bounds[i + 1]} for i in range(count)]
+    costs = [turn_cost(t, count_tokens) for t in turns]
+    if sum(costs) <= max_cost:
+        return []
+
+    count = len(_greedy_ranges(costs, max_cost))
+    if count == 1:
+        return []  # e.g. one enormous turn: nothing to split
+    lo, hi = max(costs), max_cost  # smallest cap that still yields `count` shards
+    lo = min(lo, hi)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if len(_greedy_ranges(costs, mid)) <= count:
+            hi = mid
+        else:
+            lo = mid + 1
+    ranges = _greedy_ranges(costs, hi)
+    return [{"index": i, "count": len(ranges), "start": a, "end": b, "cost": c}
+            for i, (a, b, c) in enumerate(ranges)]
 
 
-def score_shard(raw_doc, shard: dict, scorer) -> dict:
-    """Scores the turns in one shard. Returns {turn index: score dict}.
-    Raises conv.ConversationRejected if the doc is not scorable at all."""
-    turn_results = conv.load_conversation(raw_doc)
-    return score_turns(turn_results, scorer, indices=range(shard["start"], shard["end"]))
+def slice_turns(raw_doc, shard: dict) -> list:
+    """The raw turns a shard covers - what gets stored (once) per shard so a
+    worker never has to fetch the whole document to score its slice."""
+    return raw_doc["turns"][shard["start"]:shard["end"]]
+
+
+def score_shard(turns: list, shard: dict, scorer) -> dict:
+    """Scores one shard's raw turns; returns {turn index in the whole conversation: score}."""
+    turn_results = [conv.validate_turn(raw, shard["start"] + i) for i, raw in enumerate(turns)]
+    return score_turns(turn_results, scorer)
 
 
 def encode_partial(scores: dict) -> dict:

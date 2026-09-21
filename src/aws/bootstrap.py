@@ -1,7 +1,4 @@
-"""Creates the S3 buckets, SQS queues, and DynamoDB table this pipeline
-needs. Idempotent - safe on every run, against LocalStack or real AWS;
-"already exists" is treated as success. The demo's stand-in for Terraform.
-"""
+"""Creates the S3 buckets, SQS queues and DynamoDB table; idempotent, works on LocalStack or real AWS."""
 
 import json
 import logging

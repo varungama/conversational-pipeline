@@ -1,14 +1,5 @@
-"""The transport-agnostic core of the pipeline: turn a raw conversation
-document into a scored result record, or a dead-letter reason.
-
-This is deliberately the *only* place that knows how to go from
-`raw_doc -> record`. Both `src/worker.py` (the local directory-queue path)
-and `src/aws/worker.py` (the SQS/S3/DynamoDB path) call into this module so
-that scoring behaviour - metric formulas, edge-case handling, output shape -
-cannot drift between the two transports. Everything transport-specific
-(where the bytes came from, where the result goes, how "already done" is
-tracked) stays in the two worker modules.
-"""
+"""Transport-agnostic core: raw conversation -> scored record or dead-letter reason.
+Both workers call it so metrics and output shape cannot drift between transports."""
 
 import hashlib
 import json
@@ -33,21 +24,13 @@ def extract_identity(raw_doc):
 
 
 def input_content_hash(raw_doc) -> str:
-    """SHA256 of the conversation's content, independent of source
-    formatting (key order, whitespace). Answers "did the underlying
-    transcript actually change" between two scored results that otherwise
-    look alike - e.g. the same conversation_id re-delivered after an
-    upstream edit, not just re-delivered byte-for-byte. `sort_keys=True`
-    is what makes it a content hash rather than a file hash: two JSON
-    files with the same data in a different key order hash the same."""
+    """SHA256 of the conversation content, independent of key order and whitespace."""
     canonical = json.dumps(raw_doc, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _score_texts(scorer, texts: list) -> list:
-    """One batched model call for all texts when the scorer supports it, so
-    a conversation's turns share forward passes instead of paying one each.
-    Scorers without `score_batch` fall back to one call per text."""
+    """Scores all texts in one batched model call when the scorer has `score_batch`, else one call each."""
     if not texts:
         return []
     score_batch = getattr(scorer, "score_batch", None)
@@ -57,9 +40,7 @@ def _score_texts(scorer, texts: list) -> list:
 
 
 def score_turns(turn_results, scorer, indices=None) -> dict:
-    """Scores every scorable turn (valid, non-empty text) in one batch.
-    Returns {turn index: score dict}. `indices`, if given, restricts scoring
-    to those turn indices - that is how a shard scores its slice."""
+    """Scores every scorable turn in one batch; returns {turn index: score}, limited to `indices` if given (a shard)."""
     todo = [t for t in turn_results
             if t["status"] == "ok" and t["has_content"] and (indices is None or t["index"] in indices)]
     scored = _score_texts(scorer, [t["text"] for t in todo])
@@ -69,23 +50,8 @@ def score_turns(turn_results, scorer, indices=None) -> dict:
 def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer, source_ref,
                         scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING,
                         turn_scores: dict | None = None) -> dict:
-    """Builds the full output record for one already-validated conversation.
-
-    `turn_results` is the list returned by `conversation.load_conversation`.
-    `source_ref` is a transport-specific pointer to where this conversation
-    came from - a local filename for the directory queue, an S3 key for the
-    AWS path - carried through into the output for provenance.
-
-    `scored_at` defaults to the current UTC time. Passing a fixed value
-    (e.g. from `run.py --scored-at`) is what makes two runs over the same
-    input produce byte-identical output - every other field here is already
-    deterministic given the same input and the same pinned model revision,
-    so `scored_at` is the only source of run-to-run difference otherwise.
-
-    `turn_scores` ({turn index: score dict}) supplies scores computed
-    elsewhere - the merged partials of a sharded conversation. When omitted,
-    every turn is scored here in one batch.
-    """
+    """Builds the output record for a validated conversation; a fixed `scored_at` gives byte-identical reruns,
+    `turn_scores` supplies precomputed (merged shard) scores instead of scoring here, `source_ref` is the provenance pointer."""
     if turn_scores is None:
         turn_scores = score_turns(turn_results, scorer)
 
@@ -129,10 +95,7 @@ def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer
             customer_scores_unordered.append((scored["score"], scored["confidence"]))
             customer_scores_by_time.append((turn["parsed_ts"], scored["score"]))
 
-    # Chronological order comes from `ts`, not `seq`: the sample data has a
-    # fixture (c-000021) with non-monotonic and duplicate `seq` values but
-    # strictly increasing timestamps, so `ts` is the field we trust for "what
-    # happened in what order".
+    # Order by `ts`, not `seq`: fixture c-000021 has non-monotonic, duplicate `seq` but increasing timestamps.
     customer_scores_by_time.sort(key=lambda pair: pair[0])
     ordered_scores = [score for _, score in customer_scores_by_time]
 
@@ -164,20 +127,8 @@ def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer
 
 def evaluate(raw_doc, scorer, source_ref, scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING,
              turn_scores: dict | None = None):
-    """Runs the full validate-then-score pipeline for one raw document.
-
-    Returns a tuple:
-      ("dead_letter", reason)                         - whole record unusable
-      ("ok", tenant_id, conversation_id, record)       - scored successfully
-
-    Does not decide idempotency (duplicate detection) or where to persist
-    the result - that stays with the caller, since it differs by transport
-    (a JSON ledger file locally, a DynamoDB conditional write on AWS).
-
-    `scored_at`, if given, overrides the output record's timestamp - see
-    `score_conversation` for why that is the byte-identical-reruns knob.
-    `turn_scores`, if given, are precomputed per-turn scores (sharded path).
-    """
+    """Validates then scores one raw document: ("dead_letter", reason) or ("ok", tenant_id, conversation_id, record).
+    Idempotency and persistence stay with the caller; `scored_at` / `turn_scores` as in score_conversation."""
     tenant_id, conversation_id = extract_identity(raw_doc)
     if not tenant_id or not conversation_id:
         return ("dead_letter", "missing_tenant_id_or_conversation_id")

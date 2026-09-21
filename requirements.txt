@@ -1,13 +1,9 @@
-# Primary sentiment backend. If either of these two fails to install or
-# load at runtime, the pipeline automatically falls back to vaderSentiment
-# below - see src/sentiment_model.py.
+# Primary sentiment backend; if either fails to install or load, the pipeline falls back to vaderSentiment.
 torch>=2.2
 transformers>=4.40
 
-# Offline lexicon fallback - no model download, pure Python.
+# Offline lexicon fallback (pure Python).
 vaderSentiment>=3.3.2
 
-# Only imported by --backend aws (src/aws/). The default --backend local
-# run never touches this, but it's a small pure-Python package so it ships
-# by default rather than needing a second install step for the demo.
+# Only used by --backend aws, but small, so it ships by default.
 boto3>=1.34

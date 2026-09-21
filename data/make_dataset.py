@@ -1,18 +1,10 @@
-"""Build the shipped sample dataset for the sentiment pipeline.
-
-Deterministic and fully synthetic: re-running overwrites byte-identically,
-no real names/emails/phone/order numbers.
-"""
+"""Builds the shipped sample dataset: deterministic and fully synthetic (no real names, emails, phones or order numbers)."""
 
 from __future__ import annotations
 
 import json
-import logging
 import pathlib
 from datetime import datetime, timedelta, timezone
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
 
 OUT = pathlib.Path(__file__).parent / "conversations"
 TENANT_ACME = "acme"
@@ -399,9 +391,9 @@ dup = next(d for d in docs if d["conversation_id"] == "c-000002")
     json.dumps(dup, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
 )
 
-logger.info("wrote %d conversations + 1 duplicate to %s", len(docs), OUT)
+print(f"wrote {len(docs)} conversations + 1 duplicate to {OUT}")
 counts: dict[str, int] = {}
 for d in docs:
     counts[d["tenant_id"]] = counts.get(d["tenant_id"], 0) + 1
-logger.info("per tenant: %s", counts)
-logger.info("total turns: %d", sum(len(d.get("turns") or []) for d in docs if isinstance(d.get("turns"), list)))
+print("per tenant:", counts)
+print("total turns:", sum(len(d.get("turns") or []) for d in docs if isinstance(d.get("turns"), list)))

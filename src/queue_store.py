@@ -1,18 +1,5 @@
-"""A minimal, durable, file-based work queue.
-
-    pending/      work waiting to be picked up
-    processing/   claimed by a worker, in flight
-    done/         finished successfully, kept as a receipt
-    dead_letter/  could not be processed at all, with a reason file alongside
-
-Claiming a file is one `os.rename` into processing/ - atomic on the same
-filesystem, so two workers racing for a file leave exactly one winner. No
-lock server needed at this scale.
-
-Deliberately cut: no visibility timeout. A real queue (SQS) redelivers a
-crashed worker's claimed message automatically; a file left in processing/
-here just sits until a human or sweeper looks (see NOTES.md).
-"""
+"""Durable file queue (pending/ processing/ done/ dead_letter/); a claim is one atomic os.rename.
+No visibility timeout by design: a crashed worker's file stays in processing/ until someone looks."""
 
 import os
 import pathlib

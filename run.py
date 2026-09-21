@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from src.conversation import parse_timestamp
 from src.metrics import DEFAULT_WEIGHTING, WEIGHTING_CHOICES
 from src.queue_store import FileQueue
-from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer
+from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer, load_token_counter
 from src.sharding import estimate_cost, plan_shards
 from src.worker import Worker
 
@@ -19,15 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def configure_logging(log_dir: pathlib.Path, suffix: str = "") -> pathlib.Path:
-    """Logs to both the console and a timestamped file under log_dir.
-
-    One file per run, named by the UTC time the run started - so logs
-    survive after the terminal is closed, and two runs (or two workers
-    started at different times) never overwrite each other's history.
-    `suffix` (e.g. "_worker0") keeps concurrent worker *processes* from
-    trying to share one log file, which - unlike the result ledger - has no
-    claim mechanism protecting it.
-    """
+    """Logs to the console and a timestamped file in log_dir; `suffix` keeps concurrent worker processes off one file."""
     log_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log_path = log_dir / f"pipeline_{started_at}{suffix}.log"
@@ -50,11 +42,7 @@ def configure_logging(log_dir: pathlib.Path, suffix: str = "") -> pathlib.Path:
 
 def _run_one_worker_process(worker_index, work_dir_str, output_dir_str, scored_at, model_key,
                              weighting, log_dir_str, result_conn):
-    """Entry point for one `--workers` child process. Must stay a
-    module-level function (not a closure/lambda) because Windows'
-    multiprocessing "spawn" start method re-imports this module in the
-    child and pickles the target by reference, not by value.
-    """
+    """Child-process entry for `--workers`; module-level because Windows "spawn" pickles the target by reference."""
     configure_logging(pathlib.Path(log_dir_str), suffix=f"_worker{worker_index}")
     try:
         queue = FileQueue(pathlib.Path(work_dir_str))
@@ -167,7 +155,11 @@ def run_aws(args):
     conversations = S3ConversationStore(clients, config.conversations_bucket)
     results_store = S3ResultStore(clients, config.results_bucket)
     ledger = DynamoResultIndex(clients, config.ledger_table_name)
-    queue = SqsQueue(clients, infra["queue_url"], infra["dlq_url"])
+    queue = SqsQueue(clients, infra["queue_url"], infra["dlq_url"], config.visibility_timeout_seconds)
+    shard_store = S3ShardStore(clients, config.conversations_bucket)
+
+    count_tokens = load_token_counter(args.model)  # None -> costs are estimated from characters
+    logger.info("Estimating task cost from %s", "tokenizer token counts" if count_tokens else "character counts")
 
     tasks = []  # (cost, tenant_id, conversation_id, shard or None)
     enqueued = 0
@@ -176,21 +168,18 @@ def run_aws(args):
         tenant_id = raw_doc.get("tenant_id") if isinstance(raw_doc, dict) else None
         conversation_id = raw_doc.get("conversation_id") if isinstance(raw_doc, dict) else None
         if not tenant_id or not conversation_id:
-            # Cannot even form an S3 key without these - upload it under a
-            # synthetic key so it still reaches the worker and gets a
-            # proper dead-letter reason via the normal validation path.
+            # No identity for an S3 key: upload under a synthetic key so it dead-letters through normal validation.
             tenant_id, conversation_id = "unknown", source_file.stem
         conversations.put(tenant_id, conversation_id, raw_doc)
-        shards = plan_shards(raw_doc)
+        shards = plan_shards(raw_doc, count_tokens=count_tokens)
         if shards:
-            tasks.extend((shard["end"] - shard["start"], tenant_id, conversation_id, shard) for shard in shards)
+            shard_store.put_slices(tenant_id, conversation_id, raw_doc, shards)  # before any shard is enqueued
+            tasks.extend((shard["cost"], tenant_id, conversation_id, shard) for shard in shards)
         else:
-            tasks.append((estimate_cost(raw_doc), tenant_id, conversation_id, None))
+            tasks.append((estimate_cost(raw_doc, count_tokens), tenant_id, conversation_id, None))
         enqueued += 1
 
-    # Longest-processing-time-first: send the biggest tasks first. A standard
-    # SQS queue is only best-effort ordered, so this is a strong hint, not a
-    # guarantee (NOTES.md 6.1).
+    # Longest-first: biggest tasks enqueued first (SQS is best-effort ordered, so this is a hint - NOTES.md 6.1).
     tasks.sort(key=lambda task: -task[0])
     for _, tenant_id, conversation_id, shard in tasks:
         queue.enqueue(tenant_id, conversation_id, shard=shard)
@@ -201,7 +190,6 @@ def run_aws(args):
     logger.info("Using scoring backend: %s (%s @ %s)",
                 scorer.backend_name, scorer.model_name, scorer.model_revision)
 
-    shard_store = S3ShardStore(clients, config.conversations_bucket)
     worker = AwsWorker(queue, conversations, results_store, ledger, scorer, scored_at=args.scored_at,
                         weighting=args.weighting, shard_store=shard_store)
 
@@ -256,7 +244,7 @@ def main():
                          help="[local backend only] Number of worker processes to run against the same --work-dir.")
     parser.add_argument("--weighting", choices=WEIGHTING_CHOICES, default=DEFAULT_WEIGHTING,
                          help=f"How overall_sentiment averages per-turn scores (default: {DEFAULT_WEIGHTING}); see src/metrics.py.")
-    parser.add_argument("--aws-drain-timeout", type=float, default=150.0,
+    parser.add_argument("--aws-drain-timeout", type=float, default=60.0,
                          help="[aws backend only] Max seconds to keep draining the queue before giving up.")
     parser.add_argument("--log-dir", default="logs",
                          help="Where per-run log files are written.")
