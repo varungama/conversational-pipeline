@@ -80,7 +80,7 @@ Two backends. One scoring path (`src/scoring.py`), shared by both. They can't si
 - SQS for the queue. S3 for transcripts and results. DynamoDB for the ledger.
 - Claim = `ReceiveMessage`. SQS's visibility timeout hides the message from other workers.
 - A crashed worker never deletes the message. It reappears automatically.
-- Repeated failures go to a DLQ via SQS's own redrive policy. Platform handles it, not app code.
+- Repeated failures go to a DLQ via SQS's own redrive policy. The platform handles it, not app code.
 
 **Idempotency:** `tenant_id::conversation_id`, not filename.
 - Confirmed on the shipped duplicate fixture. Only one result written.
@@ -103,7 +103,7 @@ Both computed over customer turns with real content only. Empty/whitespace text 
 **`sentiment_trajectory`** — `(last_score - first_score) / 2`. Unchanged.
 - Bounded `[-1, 1]`. Endpoint-only, so comparable across short and long conversations.
 - Confidence-weighting doesn't map cleanly onto a 2-point formula. Not added.
-- A separate "volatility" metric was considered. Rejected again — one defendable formula beats four shaky ones.
+- A separate "volatility" metric was considered. Rejected again — one defensible formula beats four shaky ones.
 - 0 or 1 turns → `null`. 2+ turns → `{label, score, n_turns}`.
 
 **Ordering:** sorted by parsed `ts`, not `seq`. `seq` can be wrong; `ts` can't.
@@ -117,7 +117,7 @@ Both computed over customer turns with real content only. Empty/whitespace text 
 ## 4. Edge cases (`src/conversation.py`)
 
 - **Missing/wrong-type `turns`** — whole conversation dead-lettered. Never scored.
-- **One bad turn** — that turn is skipped with a reason. Rest of the conversation still scores.
+- **One bad turn** — that turn is skipped with a reason. The rest of the conversation still scores.
 - **Empty/whitespace text** — excluded from metrics, kept in output as `included_in_metrics: false`.
 - **Zero customer turns** — both metrics `null`.
 - **Empty `turns: []`** — same null result, no crash.
@@ -128,9 +128,9 @@ All confirmed against the shipped sample fixtures.
 
 ### 4.1 Long turns: chunk and aggregate
 
-Previously anything past 512 tokens was silently dropped, so a resolution at the end of a long message never counted. Now handled inside `SentimentScorer.score` (`src/sentiment_model.py`). `src/scoring.py` logic and both workers are untouched, so both backends get it.
+Previously, anything past 512 tokens was silently dropped, so a resolution at the end of a long message never counted. Now handled inside `SentimentScorer.score` (`src/sentiment_model.py`). `src/scoring.py` logic and both workers are untouched, so both backends get it.
 
-1. Count tokens with the model's own tokenizer. Limit is 510 (512 minus 2 special tokens).
+1. Count tokens with the model's own tokeniser. The limit is 510 (512 minus 2 special tokens).
 2. Fits → one model call, identical to before.
 3. Doesn't fit → split at sentence boundaries (`。！？`, `. ! ?` before whitespace, newlines), then pack sentences greedily into chunks under the limit.
 4. Score each chunk. Take the **token-weighted mean of per-class probabilities**, then derive label, score and confidence with the same formulas as short text.
@@ -142,7 +142,7 @@ Why it's built this way:
 - **Average probabilities, not labels:** keeps the meaning of the three output fields, and N repeats of a sentence score the same as one.
 - **Schema `1.1`:** each turn gains `n_chunks` (1 for short text, and always 1 on the VADER fallback).
 
-Tests: `tests/test_chunking.py`, using a fake scorer and tokenizer.
+Tests: `tests/test_chunking.py`, using a fake scorer and tokeniser.
 
 **Verified on the real model:**
 - Full local run: 25 processed, 1 duplicate, 2 dead-lettered. All records are schema `1.1`. Two runs give the same SHA256.
@@ -170,7 +170,7 @@ Limits:
 | Initial limitation | Status now |
 | --- | --- |
 | No real distributed queue | **Closed.** `--backend aws` is real. |
-| No retry with backoff  | AWS backend gets it free from SQS. |
+| No retry with backoff  | AWS backend gets it for free from SQS. |
 | Single worker process | **Closed.** `--workers N`, real processes. |
 | Unweighted mean only | **Half-closed.** `overall_sentiment` has `--weighting`. `sentiment_trajectory` unchanged, by design. |
 | Long turns truncated | **Closed.** Chunked and aggregated (§4.1). |
@@ -203,7 +203,7 @@ Measured on one CPU core, single-conversation-set benchmark.
 
 **Cost, as \$/month and \$/backfill (assumptions stated, not measured):**
 
-Pricing: Fargate on-demand \$0.04048/vCPU-hr. SQS \$0.40/million requests, 1M free. DynamoDB on-demand write \$1.25/million WRU. (The Fargate rate is reverse-solved from the cost/million row above, not a new assumption.)
+Pricing: Fargate on-demand \$0.04048/vCPU-hr. SQS\$0.40/million requests, 1M free. DynamoDB on-demand write \$1.25/million WRU. (The Fargate rate is reverse-solved from the cost/million row above, not a new assumption.)
 
 Steady state, 2M/day = 60M conversations/month:
 
@@ -214,7 +214,7 @@ Steady state, 2M/day = 60M conversations/month:
 | DynamoDB (60M conditional-put writes) | ~\$75/mo | ~\$75/mo |
 | **Total** | **~\$228/mo** | **~\$616/mo** |
 
-- roberta is the shipped default: ~\$616/mo. That range is an 8-vCPU flat assumption — closer to distilbert's 3.6 cores than roberta's measured 16.9.
+- roberta is the shipped default: ~\$616/mo. That range is an 8-vCPU flat assumption — closer to DistilBERT's 3.6 cores than RoBERTa's measured 16.9.
 - S3 (transcript + result writes, growing storage) not in the table — order of \$20-30/mo, small next to compute either way.
 
 Backfill, 500M conversations, one-time (cost/million × 500):
@@ -224,13 +224,13 @@ Backfill, 500M conversations, one-time (cost/million × 500):
 | On-demand | ~\$865 | ~\$4,065 |
 | Spot | ~\$260-345 | ~\$1,225-1,625 |
 
-- roberta's on-demand backfill (~\$4,065) is ≈6.6 months of its own steady-state bill, not a separate order of magnitude. It's a one-time bump worth sizing, not the number to fear.
+- Roberta's on-demand backfill (~\$4,065) is ≈6.6 months of its own steady-state bill, not a separate order of magnitude. It's a one-time bump worth sizing, not the number to fear.
 
 ---
 
 ### 6.1 Uneven work: 1 turn vs 200 turns (AWS backend)
 
-Cost per conversation varies ~200x (c-000028 has 200 turns, the median 5). CPU only, no GPU.
+Cost per conversation varies ~200x (c-000028 has 200 turns; the median is 5). CPU only, no GPU.
 
 | Step | What it does | Where |
 | --- | --- | --- |
@@ -317,7 +317,7 @@ concurrent updates to one item, so exactly one caller's update ever completes th
 can see completion, by construction, not by a retry-after-the-fact claim.
 
 **Not a lock:** a naive mutex ("first to see completion claims an exclusive lock") would leak if the
-lock-holder crashed mid-merge - stuck forever, conversation never completes. `mark_shard_landed` is a
+lock-holder crashed mid-merge - stuck forever; conversation never completes. `mark_shard_landed` is a
 monotonic, idempotent-per-shard counter instead: if the winner crashes, its un-acked SQS message gets
 redelivered, the redelivered `ADD` is a no-op and still returns True, so the merge is retried by SQS's
 own redelivery - the same self-healing mechanism the rest of the pipeline already relies on.
@@ -446,7 +446,7 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
   - Then verified against a real LocalStack container: `25 processed, 1 skipped_duplicate, 2 dead_lettered`.
   - Re-run on the same warm container: `processed: 0, skipped_duplicate: 26` — proves the ledger survives across separate processes.
   - **Real bug found:** default `--aws-drain-timeout` (30s) was too short to let SQS redrive stuck messages. Bumped to 60s. Re-run confirmed the fix.
-  - Not verified: LocalStack's fidelity to real AWS in rarer corners (IAM, edge-case API behavior).
+  - Not verified: LocalStack's fidelity to real AWS in rarer corners (IAM, edge-case API behaviour).
 - **Is AWS the right call?** Mostly yes. The 500M backfill is what justifies it — steady state (2M/day) alone would fit on a scheduled container.
 
 ---
@@ -457,9 +457,9 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 2. CloudWatch alarm on DLQ depth, wired to actually page someone.
 3. A standalone "volatility" metric, if the product ever needs to tell "flat" apart from "chaotic but flat."
 4. Re-run `scripts/fit_cost_model.py` and `scripts/benchmark.py` on the production CPU type (§6.1).
-5. ONNX Runtime + INT8 quantization — highest-value unmeasured lever, given roberta's cost.
-6. A human-labeled, real support-transcript set, for an actual accuracy number.
+5. ONNX Runtime + INT8 quantisation — highest-value unmeasured lever, given Roberta's cost.
+6. A human-labelled, real support-transcript set, for an actual accuracy number.
 7. Sarcasm / double-negation handling — still broken on both models tried so far.
 8. Retries with backoff on the local backend (AWS backend already gets this from SQS).
-9. Measure chunking's throughput cost on a set of genuinely long, real transcripts (behavior is verified, §4.1; cost is not).
-10. S3 lifecycle expiry on `slices/` and `shards/` (never deleted otherwise). ~~Chunk-level shards for very large single turns~~ — done, §6.1.1.
+9. Measure chunking's throughput cost on a set of genuinely long, real transcripts (behaviour is verified, §4.1; cost is not).
+10. S3 lifecycle expiry on `slices/` and `shards/` (never deleted otherwise).
