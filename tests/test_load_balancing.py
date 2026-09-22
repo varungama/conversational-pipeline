@@ -3,7 +3,7 @@ import unittest
 from src.aws.config import AwsConfig, worst_case_visibility_timeout
 from src.scoring import evaluate
 from src.sentiment_model import SentimentScorer, length_sorted_batches
-from src.sharding import SHARD_MAX_COST, _greedy_ranges, estimate_cost, plan_shards, turn_cost
+from src.sharding import SHARD_MAX_COST, _greedy_ranges, lpt_interleaved, estimate_cost, plan_shards, turn_cost
 from tests.stub_scorer import BatchStubScorer, StubScorer
 
 
@@ -151,6 +151,25 @@ class TestTokenCost(unittest.TestCase):
         self.assertGreater(len(shards), 1)
         self.assertEqual(sum(s["cost"] for s in shards), estimate_cost(doc, self.words))
         self.assertEqual((shards[0]["start"], shards[-1]["end"]), (0, 200))
+
+
+class TestDispatchOrder(unittest.TestCase):
+    def test_lanes_1_is_plain_longest_first(self):
+        tasks = [(3, "c"), (9, "a"), (1, "d"), (6, "b")]
+        self.assertEqual(lpt_interleaved(tasks, lanes=1), sorted(tasks, key=lambda t: -t[0]))
+
+    def test_no_receive_batch_window_gets_more_than_one_of_the_biggest_tasks(self):
+        # 5 big (cost 2500) shards and 20 small (cost 100) ones - the shape a real
+        # run produces after sharding: a receive batch of 5 must not grab several big ones
+        tasks = [(2500, f"big{i}") for i in range(5)] + [(100, f"small{i}") for i in range(20)]
+        ordered = lpt_interleaved(tasks, lanes=5)
+        for i in range(0, len(ordered) - 4, 5):
+            window = ordered[i:i + 5]
+            self.assertLessEqual(sum(1 for cost, _ in window if cost == 2500), 1)
+
+    def test_covers_every_task_exactly_once(self):
+        tasks = [(i, i) for i in range(17)]
+        self.assertEqual(sorted(t for _, t in lpt_interleaved(tasks, lanes=4)), list(range(17)))
 
 
 class TestVisibilityTimeout(unittest.TestCase):

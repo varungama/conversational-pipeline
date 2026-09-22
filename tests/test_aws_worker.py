@@ -22,8 +22,9 @@ from src.aws.s3_store import S3ConversationStore, S3ResultStore, S3ShardStore
 from src.aws.sqs_queue import SqsQueue
 from src.aws.worker import AwsWorker
 from src.scoring import evaluate, result_key
-from src.sharding import plan_shards
-from tests.stub_scorer import StubScorer
+from src.sentiment_model import chunk_text
+from src.sharding import is_chunk_shard, plan_shards
+from tests.stub_scorer import FakeChunkScorer, StubScorer, word_count
 
 
 # moto is test-only (requirements-dev.txt) so requirements.txt stays lean
@@ -102,6 +103,42 @@ class TestAwsWorker(unittest.TestCase):
         self.assertFalse(self.ledger.try_claim(key, "acme/c-3.json"))
         self.assertTrue(self.ledger.has(key))
 
+    def test_mark_shard_landed_is_true_only_once_the_set_is_complete(self):
+        key = result_key("acme", "c-shardcount")
+        self.assertFalse(self.ledger.mark_shard_landed(key, 0, total=3))
+        self.assertFalse(self.ledger.mark_shard_landed(key, 1, total=3))
+        self.assertTrue(self.ledger.mark_shard_landed(key, 2, total=3))
+        # a completed conversation's own result claim is a separate item - unaffected
+        self.assertFalse(self.ledger.has(key))
+
+    def test_mark_shard_landed_is_idempotent_under_redelivery(self):
+        # a shard message delivered twice must not let two different indices both look
+        # "complete", and a redelivery of the completing shard must still say True (so SQS's
+        # own redelivery - not a lock - is what retries a merge that crashed after winning)
+        key = result_key("acme", "c-shardcount-2")
+        self.assertFalse(self.ledger.mark_shard_landed(key, 0, total=2))
+        self.assertFalse(self.ledger.mark_shard_landed(key, 0, total=2))  # redelivered shard 0
+        self.assertTrue(self.ledger.mark_shard_landed(key, 1, total=2))
+        self.assertTrue(self.ledger.mark_shard_landed(key, 1, total=2))  # redelivered shard 1 (the winner)
+
+    def test_mark_shard_landed_has_exactly_one_winner_under_real_concurrency(self):
+        # every shard "lands" from its own thread at once - the scenario in the finding this
+        # fixes (two shards finishing simultaneously); exactly one must see completion
+        key = result_key("acme", "c-shardcount-race")
+        total = 8
+        results = [None] * total
+
+        def land(i):
+            results[i] = self.ledger.mark_shard_landed(key, i, total)
+
+        threads = [threading.Thread(target=land, args=(i,)) for i in range(total)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sum(results), 1)
+
     def test_unprocessable_message_is_left_for_retry_then_reaches_dlq(self):
         # no `turns` key - whole-record malformation, same shape as c-000029
         doc = {"conversation_id": "c-4", "tenant_id": "acme", "channel": "chat"}
@@ -155,6 +192,42 @@ class TestAwsWorker(unittest.TestCase):
         self.assertEqual(again["skipped_duplicate"], 1)
         self.assertEqual(len(self.results.list_all()), 1)
 
+    def test_shards_that_finish_simultaneously_still_merge_exactly_once(self):
+        # every shard lands "at the same time" - separate worker instances, separate threads,
+        # each doing its own S3 put + ledger update concurrently, the exact scenario the
+        # mark_shard_landed fix targets (two-shards-finish-simultaneously)
+        turns = [{"seq": i, "role": "customer", "ts": f"2026-03-02T09:{i // 60:02d}:{i % 60:02d}Z",
+                  "text": ["GOOD", "BAD", "MEH"][i % 3] + " " * 40} for i in range(120)]
+        doc = {"conversation_id": "c-race", "tenant_id": "acme", "channel": "chat", "turns": turns}
+        self.conversations.put("acme", "c-race", doc)
+        shards = plan_shards(doc)
+        self.assertGreaterEqual(len(shards), 3)
+        self.shard_store.put_slices("acme", "c-race", doc, shards)
+        for shard in shards:
+            self.queue.enqueue("acme", "c-race", shard=shard)
+
+        outcomes = [None] * len(shards)
+
+        def process(i):
+            # its own AwsWorker instance, like a separate worker process would have
+            worker = AwsWorker(self.queue, self.conversations, self.results, self.ledger, StubScorer(),
+                               shard_store=self.shard_store)
+            outcomes[i] = worker.run_once()
+
+        threads = [threading.Thread(target=process, args=(i,)) for i in range(len(shards))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sum(o["processed"] for o in outcomes), 1)  # exactly one merge, never zero or two
+        self.assertEqual(sum(o["shards_scored"] for o in outcomes), len(shards) - 1)
+        results = self.results.list_all()
+        self.assertEqual(len(results), 1)
+        expected = evaluate(doc, StubScorer(), "acme/c-race.json")[3]
+        expected["scored_at"] = results[0]["scored_at"]
+        self.assertEqual(results[0], expected)
+
     def test_shard_workers_read_only_their_slice_not_the_whole_document(self):
         turns = [{"seq": i, "role": "customer", "ts": f"2026-03-02T09:{i // 60:02d}:{i % 60:02d}Z",
                   "text": "GOOD" + " " * 40} for i in range(120)]
@@ -172,6 +245,40 @@ class TestAwsWorker(unittest.TestCase):
             self.worker.run_once()
         self.assertEqual(len(full_reads), 1)  # only the shard that merges reads the document
         self.assertEqual(len(self.results.list_all()), 1)
+
+    def test_oversized_turn_is_chunk_sharded_and_merges_to_the_unsharded_result(self):
+        import functools
+
+        chunk_fn = functools.partial(chunk_text, count_tokens=word_count)
+        long_text = "This is good. " * 200 + "This is bad. " * 200  # over CHUNK_TOKEN_LIMIT, needs >1 chunk
+        turns = [{"seq": 0, "role": "customer", "ts": "2026-03-02T09:14:00Z", "text": long_text},
+                 {"seq": 1, "role": "customer", "ts": "2026-03-02T09:15:00Z", "text": "GOOD"}]
+        doc = {"conversation_id": "c-chunked", "tenant_id": "acme", "channel": "chat", "turns": turns}
+        self.conversations.put("acme", "c-chunked", doc)
+
+        scorer = FakeChunkScorer()
+        shards = plan_shards(doc, max_cost=1000, count_tokens=word_count, chunk_text_fn=chunk_fn)
+        self.assertGreater(len(shards), 2)  # the long turn split into several chunk shards
+        self.assertTrue(any(is_chunk_shard(s) for s in shards))
+        self.shard_store.put_slices("acme", "c-chunked", doc, shards, chunk_fn)
+        for shard in shards:
+            self.queue.enqueue("acme", "c-chunked", shard=shard)
+
+        worker = AwsWorker(self.queue, self.conversations, self.results, self.ledger, scorer,
+                           shard_store=self.shard_store)
+        summary = {"processed": 0, "shards_scored": 0}
+        while self.queue.approximate_depth() > 0:
+            batch = worker.run_once()
+            summary["processed"] += batch["processed"]
+            summary["shards_scored"] += batch["shards_scored"]
+
+        self.assertEqual(summary, {"processed": 1, "shards_scored": len(shards) - 1})
+        results = self.results.list_all()
+        self.assertEqual(len(results), 1)
+        expected = evaluate(doc, scorer, "acme/c-chunked.json")[3]
+        expected["scored_at"] = results[0]["scored_at"]
+        self.assertEqual(results[0], expected)
+        self.assertEqual(results[0]["turns"][0]["n_chunks"], len(chunk_fn(long_text)))
 
     def test_slow_task_is_not_redelivered_while_it_is_still_running(self):
         class SlowScorer(StubScorer):

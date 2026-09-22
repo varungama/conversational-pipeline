@@ -2,6 +2,7 @@
 Usage: python scripts/benchmark.py [--quick] [--out numbers.json] (a few minutes on CPU)."""
 
 import argparse
+import functools
 import json
 import pathlib
 import statistics
@@ -14,8 +15,8 @@ import src.sentiment_model as sm  # noqa: E402
 from src import conversation as conv  # noqa: E402
 from src.aws.config import RECEIVE_BATCH_SIZE, worst_case_visibility_timeout  # noqa: E402
 from src.scoring import extract_identity  # noqa: E402
-from src.sentiment_model import load_token_counter  # noqa: E402
-from src.sharding import estimate_cost, plan_shards  # noqa: E402
+from src.sentiment_model import chunk_text, load_token_counter  # noqa: E402
+from src.sharding import estimate_cost, is_chunk_shard, plan_shards, slice_chunk_texts  # noqa: E402
 
 DATA = pathlib.Path(__file__).resolve().parent.parent / "data" / "conversations"
 
@@ -103,6 +104,9 @@ def main():
     turn_counts = sorted((len(d["turns"]) for d in docs), reverse=True)
     print(f"   turns per conversation, largest first: {turn_counts[:6]} ... median {statistics.median(turn_counts):.0f}")
     count_tokens = load_token_counter()  # shards are planned with token counts, as run.py does
+    # Same chunker run.py wires in, so an oversized turn shards by chunk here too - otherwise
+    # this simulation would still reflect the old one-giant-unsplittable-shard behaviour.
+    chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None
     memo = {}
 
     def measure(doc, start, end):
@@ -111,14 +115,22 @@ def main():
             memo[key] = timed(lambda: scorer.score_batch(scorable_texts(doc, start, end)), reps)
         return memo[key]
 
+    def measure_chunk_shard(doc, shard):
+        key = (doc["conversation_id"], "chunk", shard["chunk_start"], shard["chunk_end"])
+        if key not in memo:
+            chunks = [c for c, _ in slice_chunk_texts(doc, shard, chunk_text_fn)]
+            memo[key] = timed(lambda: scorer.score_batch(chunks), reps)
+        return memo[key]
+
     def tasks_at(size):
         """What the queue would hold if conversations over `size` turns were sharded:
         [(cost, seconds, conversation_id, shard_index or None), ...] in file order."""
         out = []
         for d in docs:
-            shards = plan_shards(d, max_cost=size, count_tokens=count_tokens)
+            shards = plan_shards(d, max_cost=size, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
             if shards:
-                out += [(sh["cost"], measure(d, sh["start"], sh["end"]), d["conversation_id"], sh["index"])
+                out += [(sh["cost"], measure_chunk_shard(d, sh) if is_chunk_shard(sh)
+                        else measure(d, sh["start"], sh["end"]), d["conversation_id"], sh["index"])
                         for sh in shards]
             else:
                 out.append((estimate_cost(d, count_tokens), measure(d, 0, None), d["conversation_id"], None))

@@ -78,6 +78,16 @@ def aggregate_probs(chunk_probs: list[tuple[dict, int]]) -> dict:
     return {c: sum(p.get(c, 0.0) * w for p, w in chunk_probs) / total for c in classes}
 
 
+def finalize_chunk_probs(chunk_probs: list[tuple[dict, int]]):
+    """(signed_score, confidence, label, n_chunks) for one text from its chunks' (class_probs, token_count)
+    pairs. Shared by score_batch and sharding.merge_partials (an oversized turn split across shards),
+    so the two paths cannot derive different numbers from the same chunk probabilities."""
+    probs = chunk_probs[0][0] if len(chunk_probs) == 1 else aggregate_probs(chunk_probs)
+    label, confidence = max(probs.items(), key=lambda kv: kv[1])
+    signed_score = probs.get("positive", 0.0) - probs.get("negative", 0.0)
+    return signed_score, confidence, label, len(chunk_probs)
+
+
 # Caps on one forward pass: batches are limited by padded tokens (items x longest) as well as item count,
 # or a few ~400-token chunks pad 30 short ones to 400 (measured: 56s for one batch).
 BATCH_SIZE = 32
@@ -197,13 +207,7 @@ class SentimentScorer:
         for (text_index, _, n), probs in zip(flat, flat_probs):
             per_text[text_index].append((probs, n))
 
-        outcomes = []
-        for chunk_probs in per_text:
-            probs = chunk_probs[0][0] if len(chunk_probs) == 1 else aggregate_probs(chunk_probs)
-            predicted_label, confidence = max(probs.items(), key=lambda kv: kv[1])
-            signed_score = probs.get("positive", 0.0) - probs.get("negative", 0.0)
-            outcomes.append((signed_score, confidence, predicted_label, len(chunk_probs)))
-        return outcomes
+        return [finalize_chunk_probs(chunk_probs) for chunk_probs in per_text]
 
     def _score_with_vader(self, text: str):
         polarity = self._vader.polarity_scores(text)

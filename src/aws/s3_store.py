@@ -3,7 +3,7 @@
 import json
 
 from src.aws.clients import AwsClients
-from src.sharding import decode_partial, encode_partial, slice_turns
+from src.sharding import decode_partial, encode_partial, is_chunk_shard, slice_chunk_texts, slice_turns
 
 
 def _key(tenant_id: str, conversation_id: str) -> str:
@@ -46,13 +46,16 @@ class S3ShardStore:
     def _slice_key(tenant_id: str, conversation_id: str, index: int) -> str:
         return f"slices/{tenant_id}/{conversation_id}/{index:05d}.json"
 
-    def put_slices(self, tenant_id: str, conversation_id: str, raw_doc: dict, shards: list):
-        """Stores each shard's turns. Call before enqueueing the shards."""
+    def put_slices(self, tenant_id: str, conversation_id: str, raw_doc: dict, shards: list, chunk_text_fn=None):
+        """Stores each shard's turns (or, for a chunk-level shard, that turn's own chunk texts -
+        `chunk_text_fn` is required if any shard is one). Call before enqueueing the shards."""
         for shard in shards:
+            payload = (slice_chunk_texts(raw_doc, shard, chunk_text_fn) if is_chunk_shard(shard)
+                      else slice_turns(raw_doc, shard))
             self.s3.put_object(
                 Bucket=self.bucket,
                 Key=self._slice_key(tenant_id, conversation_id, shard["index"]),
-                Body=json.dumps(slice_turns(raw_doc, shard), ensure_ascii=False).encode("utf-8"),
+                Body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 ContentType="application/json",
             )
 
@@ -75,9 +78,6 @@ class S3ShardStore:
             for obj in page.get("Contents", []):
                 keys[int(obj["Key"].rsplit("/", 1)[1][:-len(".json")])] = obj["Key"]
         return keys
-
-    def indexes(self, tenant_id: str, conversation_id: str) -> set:
-        return set(self._keys(tenant_id, conversation_id))
 
     def load(self, tenant_id: str, conversation_id: str) -> dict:
         """{shard index: {turn index: score dict}}"""

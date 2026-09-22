@@ -15,7 +15,7 @@
 | Idempotency ledger | Single-process safe only | Fixed race across multiple processes (`try_claim`) |
 | Reproducibility | `scored_at` was real time | Fixed `--scored-at`, plus `input_sha256` |
 | Long turns | Truncated at 512 tokens, rest dropped | Sentence-aware chunking + aggregation (§4.1). Schema `1.1` |
-| Uneven work | One model call per turn; whole conversation = one task | Length-sorted batching, token-cost sharding with S3 slices, longest-first dispatch, visibility heartbeat (§6.1) |
+| Uneven work | One model call per turn; whole conversation = one task | Length-sorted batching, token-cost sharding (chunk-level for an oversized turn) with S3 slices, interleaved longest-first dispatch, visibility heartbeat (§6.1) |
 
 Everything below is the full picture, current state.
 
@@ -235,11 +235,11 @@ Cost per conversation varies ~200x (c-000028 has 200 turns, the median 5). CPU o
 | Step | What it does | Where |
 | --- | --- | --- |
 | Cost estimate | ms ≈ 8 per turn + 4 per token (model tokenizer); fallback 12 per turn + 1 per char. Fit R²: turns only 0.849, +chars 0.983, **+tokens 0.988** (82 points). | `sharding.py`, `scripts/fit_cost_model.py` |
-| Shard plan | Cost over `SHARD_MAX_COST=2500` (~2.5s): fewest shards under a **hard cap**, rebalanced to near-equal. A single turn over the cap gets its own shard. | `sharding.plan_shards` |
-| Slices | Each shard's turns are written once to S3 `slices/`; a shard worker reads only its slice (500 shards: ~1.1 GB of reads becomes ~2.3 MB). | `S3ShardStore` |
-| Longest-first | `run.py` enqueues by descending cost (SQS is best-effort ordered, so a hint). | `run.py` |
+| Shard plan | Cost over `SHARD_MAX_COST=2500` (~2.5s): fewest shards under a **hard cap**, rebalanced to near-equal. A single turn over the cap is split into chunk-level shards at the model's own chunk boundaries (§6.1.1), so nothing exceeds the cap. | `sharding.plan_shards` |
+| Slices | Each shard's turns (or, for a chunk-level shard, that turn's own chunk texts) are written once to S3 `slices/`; a shard worker reads only its slice (500 shards: ~1.1 GB of reads becomes ~2.3 MB). | `S3ShardStore` |
+| Longest-first, interleaved | Sorted by descending cost, then dealt round-robin into `receive_batch_size` lanes, so one `ReceiveMessage` batch can't grab several of the biggest tasks. | `sharding.lpt_interleaved` |
 | Batching | One `score_batch` per task: chunks sorted by length, at most 32 items and 512 padded tokens per batch. | `SentimentScorer.score_batch` |
-| Merge | Each shard parks `{turn: score}` in S3 `shards/`; the last to land calls `evaluate(..., turn_scores=)`. Ledger `try_claim` and `has` cover duplicates. | `aws/worker.py` |
+| Merge | Each shard parks `{turn: score}` in S3 `shards/`; `mark_shard_landed` (atomic, §6.1.2) decides the *one* shard that calls `evaluate(..., turn_scores=)`. Ledger `try_claim` and `has` cover duplicates. | `aws/worker.py` |
 | One message per receive | `RECEIVE_BATCH_SIZE=1`; a worker holding several hoards the biggest tasks. | `aws/config.py` |
 | Visibility heartbeat | `keep_alive` re-extends the timeout every third of it while a task runs. The 6s base timeout only bounds a crashed worker. | `SqsQueue.keep_alive` |
 
@@ -249,57 +249,136 @@ Env overrides: `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTI
 
 | Item | Result |
 | --- | --- |
-| Batching | 27.2 vs 21.8 turns/s on c-000028 (1.25x); 17.7 vs 15.8 on all turns (1.12x) |
-| `MAX_BATCH_TOKENS` | 128-1024 within ~7%; 2048 → 14.7, 4096 → 11.0, unlimited → 4.1 turns/s. 512 chosen |
+| Batching | 27.0 turns/s batched on c-000028, stable across runs; the unbatched baseline is noisy machine-to-machine (6.9-21.8 t/s measured), so its exact speedup ratio isn't reported here - batching is unambiguously faster, just not to a precise x |
+| `MAX_BATCH_TOKENS` | 128-1024 within ~4%; 2048 → 14.3, 4096 → 11.0, unlimited → 4.5 turns/s. 512 chosen |
 | Cost model | Measured 1.11 ms per cost unit on unsharded tasks (1.00 = perfect): ~11% underestimate |
-| Worst task | 7.35s unsharded (c-000028) → **3.28s** at cap 2500 (c-000027, one unsplittable 854-token turn) |
+| Worst task | 7.37s unsharded (c-000028) → **2.21s** at cap 2500 - inside the cap, chunk-splitting §6.1.1 fixed the old 3.28s outlier |
 
 | `SHARD_MAX_COST` | Tasks | Largest | Extra work | Makespan, 4 workers | 8 workers |
 | --- | --- | --- | --- | --- | --- |
-| 1200 | 32 | 3.28s | +12% | 5.7s | 3.3s |
-| **2500** | 29 | 3.28s | +7% | 5.4s | 3.3s |
-| 5000 | 26 | 3.94s | +2% | 5.3s | 3.9s |
+| 1200 | 33 | 1.87s | +10% | 5.7s | 3.0s |
+| **2500** | 30 | 2.21s | +6% | 5.4s | 2.8s |
+| 5000 | 26 | 3.95s | +3% | 5.3s | 4.0s |
 
-**Shard plan on the shipped data** (cap 2500; costs in ~ms, tokens vs the character fallback):
+**Shard plan on the shipped data** (cap 2500; costs in ~ms, from the model tokenizer):
 
-| Conversation | Shard | Turns | Cost (tokens) | Cost (chars) |
+| Conversation | Shard | Turns | Chunks | Cost |
 | --- | --- | --- | --- | --- |
-| c-000027 (3 turns) | 0 | 0 | **3,424** | **3,950** |
-| | 1 | 1–2 | 148 | 158 |
-| c-000028 (200 turns) | 0 | 0–49 | 1,928 | 2,090 |
-| | 1 | 50–99 | 1,912 | 2,098 |
-| | 2 | 100–149 | 1,928 | 2,090 |
-| | 3 | 150–199 | 1,912 | 2,098 |
+| c-000027 (3 turns) | 0 | 0 | 0–0 of 2 | 1,916 |
+| | 1 | 0 | 1–1 of 2 | 1,516 |
+| | 2 | 1–2 | whole turns | 148 |
+| c-000028 (200 turns) | 0 | 0–49 | whole turns | 1,928 |
+| | 1 | 50–99 | whole turns | 1,912 |
+| | 2 | 100–149 | whole turns | 1,928 |
+| | 3 | 150–199 | whole turns | 1,912 |
 
-- c-000027 turn 0 (~4,000 characters) exceeds the cap alone and cannot be split, so it gets its own shard (the 3.7s case).
-- c-000028 costs 7,680 (tokens): at least 4 shards, rebalanced to within ~1% of each other, all under the cap.
-- The other 23 conversations cost under 2,500 and stay whole. 28 files → 26 whole tasks + 6 shards = **32 tasks**.
+- c-000027 turn 0 (854 tokens, ~4,000 characters) exceeds the cap alone (was 3,424 before this) - it's now split at the model's own 510-token chunk boundaries (§6.1.1) into 2 chunk-level shards, both under the cap. Turns 1-2 are small and share a normal shard.
+- c-000028 costs 7,680: at least 4 shards, rebalanced to within ~1% of each other, all under the cap.
+- The other 23 conversations cost under 2,500 and stay whole. 28 files → 26 whole tasks + 7 shards (3 + 4) = **33 tasks** (was 32 before chunk-splitting added one).
 
 Simulated makespan from those task times:
 
 | Workers | Unsharded | Longest-first | + shards ≤2500 | Lower bound |
 | --- | --- | --- | --- | --- |
 | 1 | 20.2s | 20.2s | 21.5s | 20.2s |
-| 2 | 13.6s | 10.2s | 10.8s | 10.1s |
-| 4 | 10.1s | 7.3s | 5.4s | 5.1s |
-| 8 | 8.4s | 7.3s | 3.3s | 2.5s |
+| 2 | 13.7s | 10.1s | 10.8s | 10.1s |
+| 4 | 10.0s | 7.4s | 5.4s | 5.1s |
+| 8 | 8.4s | 7.4s | 2.8s | 2.5s |
 
-**Real 4-worker run on LocalStack** (3 torch threads each; measured before the token cost and heartbeat, not re-run):
+#### 6.1.1 Chunk-level sharding: a turn bigger than the cap on its own
 
-| Receive batch | Unsharded | Longest-first | Sharded + longest-first |
-| --- | --- | --- | --- |
-| 1 | 23.9s | 17.4s (1.37x) | **15.8s (1.51x)** |
-| 5 | 22.0s | 28.2s (0.78x) | 26.0s (0.84x) |
+Before this, a single turn costlier than `SHARD_MAX_COST` couldn't be split - it shipped as one
+oversized shard (c-000027 turn 0: cost 3,424 against a 2,500 cap, the whole reason the visibility
+timeout needed the `keep_alive` heartbeat rather than a fixed number). The scorer already had to cut
+that same turn into ≤510-token chunks to fit the model's window (`sentiment_model.chunk_text`,
+§4.1); this reuses exactly that chunker to shard at chunk granularity instead of turn granularity, so
+the same worst-case turn now costs at most one chunk's worth of work per shard (2,048 max, well under
+the 3,424 it used to be).
 
-With a batch of 5, one worker grabs the 5 biggest tasks and becomes the tail, hence the default of 1 (cost: ~1 extra SQS request per task, negligible).
+**Contract change:** a shard descriptor optionally carries `chunk_start`/`chunk_end` - indices into
+that one turn's own chunk list (`is_chunk_shard(shard)`). Its S3 slice holds that turn's chunk texts,
+not the raw turn. Its worker payload is a partial that is **not** a finished score -
+`{turn index: {"_chunk_probs": [[class_probs, token_count], ...]}}` - because a chunk's probabilities
+can't be finalised (label/score/confidence) until every chunk-shard of that turn has landed.
+`merge_partials` pools the `_chunk_probs` lists across shards once the conversation's shard count is
+complete, and finalises each turn with the same formula the un-sharded scorer uses
+(`sentiment_model.finalize_chunk_probs`, factored out so the two paths cannot diverge) - a whole-turn
+shard's already-finished score passes through merge unchanged, so both kinds coexist in one plan.
+
+**Verified equal to unsharded, real model, real shipped data (c-000027):** scoring turn 0 whole gives
+`{"label": "negative", "score": -0.9968, "confidence": 0.9983, "n_chunks": 2}`; scoring it as 2
+chunk-shards and merging gives the exact same dict, and the exact same final record end to end
+(`evaluate()` with the merged scores equals `evaluate()` unsharded, byte for byte). Confirmed again
+through a real `run.py --backend aws` run against LocalStack - c-000027's stored result matches.
+Moto test: `test_oversized_turn_is_chunk_sharded_and_merges_to_the_unsharded_result`. Real-model check:
+`scripts/fit_cost_model.py`-adjacent ad hoc script, not shipped.
+
+**Transformer-only.** `score_chunk_shard` needs `scorer._class_probs_batch`, which the VADER fallback
+doesn't have (VADER has no window limit, so it never needs this). `plan_shards` is only given a
+`chunk_text_fn` when a tokenizer loaded, which is a reasonable proxy but not a guarantee the scorer
+itself will end up on the transformer backend (see NOTES.md limits below).
+
+#### 6.1.2 Shard-merge race, fixed
+
+**Finding:** two shards can finish "simultaneously" - both see `len(shard_store.indexes(...)) ==
+count`, both call `merge_partials` + `evaluate()`, both attempt `try_claim`. Correct (`try_claim` lets
+only one actually persist the result; the loser acks as `skipped_duplicate`) but wasteful: the loser
+did a full S3 `GET` of the raw document and built the whole output record for nothing. The root cause
+is that the old check was list-then-compare - two shards can both list the same completed set before
+either has "claimed" anything, a read-then-decide gap.
+
+**Fix:** replaced the S3 listing check with `DynamoResultIndex.mark_shard_landed(key, shard_index,
+total)` - one atomic DynamoDB `UpdateItem` (`ADD` to a set) per shard landing, in a separate item
+(`"shards::" + key`) from the result claim so it can never collide with `try_claim`. DynamoDB
+serialises concurrent updates to the same item, so **exactly one** caller's update is ever the one
+that brings the set to `total` size - no two shards can both see completion, by construction, not by
+a retry-after-the-fact claim. Only that one shard proceeds to `merge_partials`/`evaluate`; every other
+shard's cost is one small atomic write, not a full document fetch and record build.
+
+**Why not a lock instead:** a naive fix would be a mutex ("first shard to see completion claims an
+exclusive lock, does the merge"). Rejected - if the lock-holder crashes mid-merge, the lock is stuck
+forever with no lease/expiry, and the conversation would never complete. `mark_shard_landed` isn't a
+lock: it's a monotonic, idempotent-per-shard-index counter. If the winning shard crashes before
+finishing, its SQS message was never acked, so SQS redelivers it; the redelivered call adds the same
+already-present index (a no-op) and still returns True (nothing is ever removed from the set), so the
+merge is retried by SQS's own redelivery - the same self-healing mechanism the rest of this pipeline
+already relies on, not a new one.
+
+**Verified:**
+- Moto: `test_mark_shard_landed_is_true_only_once_the_set_is_complete`,
+  `test_mark_shard_landed_is_idempotent_under_redelivery`,
+  `test_mark_shard_landed_has_exactly_one_winner_under_real_concurrency` (8 threads landing at once,
+  exactly 1 `True`), `test_shards_that_finish_simultaneously_still_merge_exactly_once` (3 separate
+  `AwsWorker` instances, 3 threads, processing 3 real shard messages concurrently through the full
+  `_handle` path - exactly one `processed`, result equals `evaluate()` unsharded).
+- Real LocalStack, not moto: same three properties (sequential correctness, idempotent redelivery,
+  exactly 1 winner of 10 threads racing) reproduced against real DynamoDB semantics, ad hoc script.
+- Real 4-*process* concurrency (not threads): `scripts/bench_workers.py --workers 4`, sharded mode,
+  2 repeats - `results: 25` both times (25 conversations in, 25 merged records out, every time).
+- `ReturnValues="ALL_NEW"`, not `"UPDATED_NEW"` - a redelivered shard's `ADD` is a no-op, and
+  DynamoDB-local/moto then omits the attribute from `UPDATED_NEW` entirely rather than reporting it
+  unchanged; found by the idempotent-redelivery test failing, not by inspection.
+- `S3ShardStore.indexes()` removed - dead code once the completion check no longer lists S3.
+
+**Real 4-worker run on LocalStack, with `lpt_interleaved`** (3 torch threads each, 25 conversations):
+
+| Receive batch | Unsharded | Longest-first | Sharded + longest-first | Worker finish times (sharded) |
+| --- | --- | --- | --- | --- |
+| 1 | 22.1s | 17.4s (1.27x) | **16.4s (1.35x)** | [16.2, 16.3, 16.3, 16.4] |
+| 5 | 20.7s | 19.9s (1.04x) | 17.7s (1.17x) | [11.6, 15.2, 15.7, 17.7] |
+
+Before `lpt_interleaved` (plain longest-first sort, same machine, an earlier run): batch 1 gave 15.8s (1.51x), batch 5 regressed to 26.0s (0.84x) — one worker grabbed the 5 biggest tasks. Interleaving fixes most of that: batch 5's sharded makespan is now 1.08x batch 1's, not 1.65x. It is not perfect — worker finish times at batch 5 still spread over 6s (11.6 to 17.7), against 0.2s at batch 1 — because interleaving trades "biggest task starts absolute first" for "no window is all-big," not for perfect balance. `RECEIVE_BATCH_SIZE` stays 1 by default regardless; this is what makes raising it safe if the SQS request-count saving is ever wanted.
+
+**Why batch 5 regressed, and the fix:** one `ReceiveMessage` call returns up to `receive_batch_size` messages to whichever worker calls it - SQS does not round-robin within a call. Sorted strictly biggest-first, the front of the queue *is* the 5 biggest tasks, so the first poller gets all 5. `lpt_interleaved` deals the sorted list round-robin into `receive_batch_size` lanes before enqueueing, so no batch-sized window is all-big; the single biggest task still goes out first, the trade-off is that the 2nd-5th biggest start a little later. Matches a synthetic check (26 small + 6 near-cap tasks, `scripts/benchmark.py`'s `simulate`, 4 workers): batch 5 makespan 9.88s sorted vs 6.21s interleaved. `lanes=1` reproduces the exact old sort.
 
 **Scores are not bit-identical to per-turn or unsharded scoring.** Batch composition changes padding: 73/319 turn scores differ from the pre-batching run (max 0.004), sharded c-000028 differs from unsharded by up to ~0.002. No labels changed. Deterministic for a fixed input and shard plan.
 
-**Verified:** 65 tests pass (stub scorers, moto). Real model: local run 25 processed, 1 duplicate, 2 dead-lettered. Real LocalStack: same counts, 2 dead-lettered after 3 retries, 4 shard partials merged.
+**Verified:** 83 tests pass (stub scorers, moto). Real model: local run 25 processed, 1 duplicate, 2 dead-lettered. Real LocalStack: same counts, 2 dead-lettered after 3 retries, 5 shard partials merged (was 4 - c-000027's turn 0 is now 2 chunk-shards instead of 1 oversized one).
 
 **Limits**
 - One machine, 25 conversations, one big one: re-run `scripts/fit_cost_model.py` and `scripts/benchmark.py` on the production CPU type.
-- A single turn over the cap cannot be split; the fix for very large turns is chunk-level shards.
+- Chunk-level sharding (§6.1.1) still leaves one chunk (≤2,048 cost) as the smallest unsplittable unit; a single sentence too large even for one chunk is hard-split by characters (§4.1) but that path was not exercised by real data here.
+- If the tokenizer loads but the full model then falls back to VADER (mismatched availability), a planned chunk-level shard would reach a non-transformer worker and raise clearly rather than silently mis-score - not exercised against a real such failure.
 - A dead-lettered shard reaches the DLQ; that conversation gets no result.
 - `slices/` and `shards/` are never deleted: add an S3 lifecycle expiry on both.
 - The local backend has batched scoring only: no sharding or cost ordering.
@@ -398,4 +477,4 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 7. Sarcasm / double-negation handling — still broken on both models tried so far.
 8. Retries with backoff on the local backend (AWS backend already gets this from SQS).
 9. Measure chunking's throughput cost on a set of genuinely long, real transcripts (behavior is verified, §4.1; cost is not).
-10. Chunk-level shards for very large single turns; S3 lifecycle expiry on `slices/` and `shards/`.
+10. S3 lifecycle expiry on `slices/` and `shards/` (never deleted otherwise). ~~Chunk-level shards for very large single turns~~ — done, §6.1.1.

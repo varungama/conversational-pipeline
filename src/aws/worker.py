@@ -9,7 +9,7 @@ from src.aws.s3_store import S3ConversationStore, S3ResultStore, S3ShardStore
 from src.aws.sqs_queue import Message, SqsQueue
 from src.metrics import DEFAULT_WEIGHTING
 from src.scoring import evaluate, result_key
-from src.sharding import merge_partials, score_shard
+from src.sharding import is_chunk_shard, merge_partials, score_chunk_shard, score_shard
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +73,14 @@ class AwsWorker:
             try:
                 # Only this shard's slice is read; the whole document is
                 # fetched below, once per conversation, by the merging shard.
-                turns = self.shard_store.get_slice(tenant_id, conversation_id, shard["index"])
-                self.shard_store.put(tenant_id, conversation_id, shard["index"],
-                                     score_shard(turns, shard, self.scorer))
-                if len(self.shard_store.indexes(tenant_id, conversation_id)) < shard["count"]:
-                    self.queue.ack(message)  # partial is durable; the last shard to land does the merge
+                slice_data = self.shard_store.get_slice(tenant_id, conversation_id, shard["index"])
+                partial = (score_chunk_shard(slice_data, shard, self.scorer) if is_chunk_shard(shard)
+                          else score_shard(slice_data, shard, self.scorer))
+                self.shard_store.put(tenant_id, conversation_id, shard["index"], partial)
+                # Atomic: exactly one shard's call here returns True, however many land at once
+                # (DynamoResultIndex.mark_shard_landed) - that shard, and only that one, merges.
+                if not self.ledger.mark_shard_landed(key, shard["index"], shard["count"]):
+                    self.queue.ack(message)  # partial is durable; the shard that completes the set does the merge
                     return "shards_scored"
                 turn_scores = merge_partials(self.shard_store.load(tenant_id, conversation_id))
             except Exception:
@@ -131,10 +134,14 @@ class AwsWorker:
                 break
             for message in batch:
                 shard = message.body.get("shard")
+                detail = ""
+                if shard:
+                    detail = f"; shard {shard['index'] + 1} of {shard['count']}"
+                    if is_chunk_shard(shard):
+                        detail += f" (chunks {shard['chunk_start']}-{shard['chunk_end'] - 1} of turn {shard['start']})"
                 dead_letters.append({
                     "source_file": f"{message.body.get('tenant_id')}/{message.body.get('conversation_id')}.json",
-                    "reason": "exceeded_max_receive_count (see worker logs for per-attempt reasons)"
-                              + (f"; shard {shard['index'] + 1} of {shard['count']}" if shard else ""),
+                    "reason": "exceeded_max_receive_count (see worker logs for per-attempt reasons)" + detail,
                 })
                 self.queue.ack_dead_letter(message)
         return dead_letters

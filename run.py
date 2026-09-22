@@ -1,6 +1,7 @@
 """Score every conversation in an input directory with a sentiment model and write durable JSON results, via a local file-based queue or AWS (SQS + S3 + DynamoDB)."""
 
 import argparse
+import functools
 import json
 import logging
 import multiprocessing as mp
@@ -11,8 +12,8 @@ from datetime import datetime, timezone
 from src.conversation import parse_timestamp
 from src.metrics import DEFAULT_WEIGHTING, WEIGHTING_CHOICES
 from src.queue_store import FileQueue
-from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer, load_token_counter
-from src.sharding import estimate_cost, plan_shards
+from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer, chunk_text, load_token_counter
+from src.sharding import estimate_cost, lpt_interleaved, plan_shards
 from src.worker import Worker
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,9 @@ def run_aws(args):
 
     count_tokens = load_token_counter(args.model)  # None -> costs are estimated from characters
     logger.info("Estimating task cost from %s", "tokenizer token counts" if count_tokens else "character counts")
+    # Same chunker the scorer itself uses (src/sentiment_model.py), bound to this run's tokenizer, so an
+    # oversized single turn can be split into chunk-level shards instead of staying one unsplittable task.
+    chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None
 
     tasks = []  # (cost, tenant_id, conversation_id, shard or None)
     enqueued = 0
@@ -171,16 +175,16 @@ def run_aws(args):
             # No identity for an S3 key: upload under a synthetic key so it dead-letters through normal validation.
             tenant_id, conversation_id = "unknown", source_file.stem
         conversations.put(tenant_id, conversation_id, raw_doc)
-        shards = plan_shards(raw_doc, count_tokens=count_tokens)
+        shards = plan_shards(raw_doc, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
         if shards:
-            shard_store.put_slices(tenant_id, conversation_id, raw_doc, shards)  # before any shard is enqueued
+            shard_store.put_slices(tenant_id, conversation_id, raw_doc, shards, chunk_text_fn)  # before enqueueing
             tasks.extend((shard["cost"], tenant_id, conversation_id, shard) for shard in shards)
         else:
             tasks.append((estimate_cost(raw_doc, count_tokens), tenant_id, conversation_id, None))
         enqueued += 1
 
-    # Longest-first: biggest tasks enqueued first (SQS is best-effort ordered, so this is a hint - NOTES.md 6.1).
-    tasks.sort(key=lambda task: -task[0])
+    # Longest-first, interleaved by receive batch size so one ReceiveMessage can't grab several big tasks at once.
+    tasks = lpt_interleaved(tasks, config.receive_batch_size)
     for _, tenant_id, conversation_id, shard in tasks:
         queue.enqueue(tenant_id, conversation_id, shard=shard)
     logger.info("Enqueued %d conversation file(s) from %s as %d task(s)", enqueued, input_dir, len(tasks))

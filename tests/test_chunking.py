@@ -1,30 +1,7 @@
 import unittest
 
-from src.sentiment_model import SentimentScorer, aggregate_probs, chunk_text, split_sentences
-
-
-def word_count(text: str) -> int:
-    """Stand-in tokenizer: one token per whitespace-separated word."""
-    return len(text.split())
-
-
-class FakeChunkScorer(SentimentScorer):
-    """Real `score` / chunking / aggregation, fake model: a chunk is positive
-    if it contains 'good' and not 'not good', else negative."""
-
-    def __init__(self):  # skip model loading
-        self.backend_name = "transformer"
-        self.neutral_threshold = 0.2
-
-    def _count_tokens(self, text):
-        return word_count(text)
-
-    def _class_probs_batch(self, chunks, lengths):
-        return [self._class_probs(c) for c in chunks]
-
-    def _class_probs(self, text):
-        positive = "good" in text and "not good" not in text
-        return {"positive": 0.9, "negative": 0.1} if positive else {"positive": 0.1, "negative": 0.9}
+from src.sentiment_model import aggregate_probs, chunk_text, split_sentences
+from tests.stub_scorer import FakeChunkScorer, word_count
 
 
 class TestSplitting(unittest.TestCase):

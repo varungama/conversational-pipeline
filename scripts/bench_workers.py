@@ -2,6 +2,7 @@
 Reports the time from a shared barrier until the last worker finishes."""
 
 import argparse
+import functools
 import json
 import multiprocessing as mp
 import os
@@ -20,8 +21,8 @@ from src.aws.dynamo_ledger import DynamoResultIndex  # noqa: E402
 from src.aws.s3_store import S3ConversationStore, S3ResultStore, S3ShardStore  # noqa: E402
 from src.aws.sqs_queue import SqsQueue  # noqa: E402
 from src.aws.worker import AwsWorker  # noqa: E402
-from src.sentiment_model import load_token_counter  # noqa: E402
-from src.sharding import estimate_cost, plan_shards  # noqa: E402
+from src.sentiment_model import chunk_text, load_token_counter  # noqa: E402
+from src.sharding import estimate_cost, lpt_interleaved, plan_shards  # noqa: E402
 
 MODES = ("unsharded", "lpt", "sharded")
 
@@ -70,18 +71,19 @@ def run_mode(mode, docs, workers, threads, prefetch):
     queue = SqsQueue(clients, infra["queue_url"], infra["dlq_url"])
 
     count_tokens = load_token_counter()
+    chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None
     tasks = []  # (cost, tenant, conversation, shard)
     for doc in docs:
         store.put(doc["tenant_id"], doc["conversation_id"], doc)
-        shards = plan_shards(doc, count_tokens=count_tokens) if mode == "sharded" else []
+        shards = plan_shards(doc, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn) if mode == "sharded" else []
         if shards:
             S3ShardStore(clients, config.conversations_bucket).put_slices(
-                doc["tenant_id"], doc["conversation_id"], doc, shards)
+                doc["tenant_id"], doc["conversation_id"], doc, shards, chunk_text_fn)
             tasks += [(s["cost"], doc["tenant_id"], doc["conversation_id"], s) for s in shards]
         else:
             tasks.append((estimate_cost(doc, count_tokens), doc["tenant_id"], doc["conversation_id"], None))
     if mode != "unsharded":
-        tasks.sort(key=lambda t: -t[0])
+        tasks = lpt_interleaved(tasks, prefetch)  # same interleave run.py uses
     for _, tenant, cid, shard in tasks:
         queue.enqueue(tenant, cid, shard=shard)
 
@@ -111,7 +113,7 @@ def main():
     docs = load_valid_docs()
     threads = max(1, (os.cpu_count() or 1) // args.workers)
     print(f"{args.workers} workers x {threads} torch threads, {len(docs)} conversations "
-          f"({sum(len(d['turns']) for d in docs)} turns), prefetch {RECEIVE_BATCH_SIZE}\n")
+          f"({sum(len(d['turns']) for d in docs)} turns), prefetch {args.prefetch}\n")
     print(f"{'mode':<11}{'tasks':>6}{'results':>9}{'makespan':>10}   each worker finished at (s)")
     summary = {}
     for mode in MODES:
