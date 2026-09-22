@@ -1,19 +1,18 @@
-"""Splits a huge conversation into shards scored independently (turns are independent) and merged by scoring.evaluate.
-Cost (~ms) = 8/turn + 4/token (fit: scripts/fit_cost_model.py, R2 98.8%), or 12/turn + 1/char without a tokenizer."""
+"""Splits a huge conversation into shards scored independently and merged by scoring.evaluate."""
+
+import hashlib
+import json
 
 from src import conversation as conv
-from src.scoring import extract_identity, score_turns
+from src.scoring import extract_identity, input_content_hash, score_turns
 from src.sentiment_model import finalize_chunk_probs
 
-COST_PER_TURN = 8    # ~ms of fixed work per turn (fitted: 7.9 ms)
-COST_PER_TOKEN = 4   # ~ms per token of text      (fitted: 4.05 ms)
-# Fallback when no tokenizer is available (fitted with a 12.5 ms per turn: 12.5 + 0.88/char)
-COST_PER_TURN_CHARS = 12
+COST_PER_TURN = 8    # ~ms fixed work per turn (fitted)
+COST_PER_TOKEN = 4   # ~ms per token (fitted)
+COST_PER_TURN_CHARS = 12  # fallback per-turn cost without a tokenizer
 COST_PER_CHAR = 1
 
-# Max cost per shard (~2.5s), also what the visibility timeout is sized against;
-# a single turn bigger than this cannot be split and gets its own shard.
-SHARD_MAX_COST = 2500
+SHARD_MAX_COST = 2500  # hard cap per shard (~2.5s); an oversized turn gets its own shard
 
 
 def _token_cost(tokens: int) -> int:
@@ -21,8 +20,7 @@ def _token_cost(tokens: int) -> int:
 
 
 def turn_cost(raw_turn, count_tokens=None) -> int:
-    """`count_tokens`, if given, is a str -> int function (the model's
-    tokenizer); otherwise the text's length in characters is used."""
+    """Cost by tokens if `count_tokens` (str -> int) is given, else by character length."""
     text = raw_turn.get("text") if isinstance(raw_turn, dict) else None
     if not isinstance(text, str) or not text.strip():
         return COST_PER_TURN if count_tokens else COST_PER_TURN_CHARS
@@ -32,8 +30,7 @@ def turn_cost(raw_turn, count_tokens=None) -> int:
 
 
 def estimate_cost(raw_doc, count_tokens=None) -> int:
-    """Relative cost of scoring this document. Malformed docs cost 1 - they
-    are rejected quickly."""
+    """Relative cost of scoring this document; malformed docs cost 1 (rejected quickly)."""
     turns = raw_doc.get("turns") if isinstance(raw_doc, dict) else None
     if not isinstance(turns, list):
         return 1
@@ -53,9 +50,7 @@ def _greedy_ranges(costs: list, cap: int) -> list:
 
 
 def _pack(costs: list, cap: int) -> list:
-    """Fewest contiguous ranges under `cap` (via `_greedy_ranges`), then the cap is
-    lowered as far as that count allows, so ranges come out near-equal instead of
-    full-full-...-sliver. Shared by whole-turn and chunk-level packing."""
+    """Fewest ranges under `cap`, then cap lowered as far as that count allows so ranges come out near-equal."""
     ranges = _greedy_ranges(costs, cap)
     count = len(ranges)
     if count == 1:
@@ -71,14 +66,8 @@ def _pack(costs: list, cap: int) -> list:
 
 
 def plan_shards(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=None, chunk_text_fn=None) -> list[dict]:
-    """Returns [] to process whole, else shard descriptors {"index", "count", "start", "end", "cost"} covering every turn once.
-    `max_cost` is a hard cap; fewest shards, then rebalanced near-equal. Malformed docs are not sharded.
-
-    A single turn bigger than `max_cost` on its own cannot be split at turn granularity. If `chunk_text_fn`
-    (`text -> [(chunk, token_count), ...]`, normally `sentiment_model.chunk_text` bound to the model's
-    tokenizer) is given, such a turn is instead split into chunk-level shards - the extra keys
-    `"chunk_start"`/`"chunk_end"` index into that turn's own chunk list, and `"start"`/`"end"` both name
-    that one turn. Without `chunk_text_fn` (the old behaviour), it still gets one oversized shard."""
+    """[] to process whole, else shard descriptors covering every turn once, capped at `max_cost`.
+    A turn over `max_cost` alone is chunk-split via `chunk_text_fn` if given, else kept as one oversized shard."""
     tenant_id, conversation_id = extract_identity(raw_doc)
     if not tenant_id or not conversation_id:
         return []
@@ -104,14 +93,22 @@ def plan_shards(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=None, chun
                                 for a, b, c in _pack(chunk_costs, max_cost)]
         shards.extend(chunk_shards or [{"start": start, "end": end, "cost": cost}])
 
-    # One range and it couldn't be chunk-split either (no chunk_text_fn, or one
-    # unsplittable chunk): truly nothing to shard, e.g. one enormous turn alone.
-    if len(shards) == 1:
+    if len(shards) == 1:  # nothing to shard, e.g. one enormous unsplittable turn alone
         return []
 
     for i, shard in enumerate(shards):
         shard["index"], shard["count"] = i, len(shards)
+    h = plan_hash(raw_doc, shards)
+    for shard in shards:
+        shard["plan_hash"] = h
     return shards
+
+
+def plan_hash(raw_doc, shards: list[dict]) -> str:
+    """Short id of this doc's content + shard plan; scopes S3/DynamoDB shard state so a replanned rerun can't merge stale data."""
+    canonical = json.dumps({"content": input_content_hash(raw_doc), "shards": shards},
+                            sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def is_chunk_shard(shard: dict) -> bool:
@@ -119,10 +116,7 @@ def is_chunk_shard(shard: dict) -> bool:
 
 
 def plan_shards_and_cost(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=None, chunk_text_fn=None):
-    """(shards, total_cost) in one pass over the doc's turns - shards is `[]` for the common
-    case (the doc fits `max_cost` whole). Equivalent to calling `plan_shards` then
-    `estimate_cost` on the same doc, but tokenizes each turn once instead of twice for that
-    common case; callers that need both (run.py, the benchmark scripts) should use this."""
+    """(shards, total_cost) in one pass; equivalent to plan_shards + estimate_cost but tokenizes each turn once."""
     tenant_id, conversation_id = extract_identity(raw_doc)
     turns = raw_doc.get("turns") if isinstance(raw_doc, dict) else None
     if not tenant_id or not conversation_id or not isinstance(turns, list):
@@ -134,16 +128,7 @@ def plan_shards_and_cost(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=N
 
 
 def lpt_interleaved(tasks: list, lanes: int) -> list:
-    """Longest-first order, dealt round-robin into `lanes` buckets and
-    concatenated, so any `lanes`-sized window mixes big and small costs -
-    safe to enqueue before a receive batch > 1 (one ReceiveMessage call can
-    otherwise return several of the biggest tasks to a single worker).
-    `tasks`: anything sortable by `tasks[i][0]` (cost first). `lanes <= 1`
-    is plain longest-first, unchanged from before this existed. Assumes delivery
-    order roughly tracks enqueue order - true on a single-process queue
-    (LocalStack, the only target this has been measured against), but SQS
-    standard queues only promise best-effort ordering, more so at real
-    multi-partition scale."""
+    """Longest-first, dealt round-robin into `lanes` buckets so no `lanes`-sized receive-batch window is all-big."""
     ordered = sorted(tasks, key=lambda t: -t[0])
     if lanes <= 1:
         return ordered
@@ -152,30 +137,24 @@ def lpt_interleaved(tasks: list, lanes: int) -> list:
 
 
 def slice_turns(raw_doc, shard: dict) -> list:
-    """The raw turns a whole-turn shard covers - what gets stored (once) per
-    shard so a worker never has to fetch the whole document to score its slice."""
+    """The raw turns a whole-turn shard covers - stored once so a worker never fetches the whole doc."""
     return raw_doc["turns"][shard["start"]:shard["end"]]
 
 
 def slice_chunk_texts(raw_doc, shard: dict, chunk_text_fn) -> list:
-    """The (chunk, token_count) pairs one chunk-level shard covers: re-chunks
-    that one turn (same `chunk_text_fn` used at planning time, so boundaries
-    match exactly) and slices `[chunk_start:chunk_end]`."""
+    """The (chunk, token_count) pairs one chunk-level shard covers: re-chunks the turn and slices by index."""
     text = raw_doc["turns"][shard["start"]]["text"]
     return chunk_text_fn(text)[shard["chunk_start"]:shard["chunk_end"]]
 
 
 def score_shard(turns: list, shard: dict, scorer) -> dict:
-    """Scores one whole-turn shard's raw turns; returns {turn index in the whole conversation: score}."""
+    """Scores one whole-turn shard; returns {turn index in the whole conversation: score}."""
     turn_results = [conv.validate_turn(raw, shard["start"] + i) for i, raw in enumerate(turns)]
     return score_turns(turn_results, scorer)
 
 
 def score_chunk_shard(chunks: list, shard: dict, scorer) -> dict:
-    """Scores one chunk-level shard's (chunk, token_count) pairs (transformer backend only - `scorer`
-    must have `_class_probs_batch`). Returns a partial that is NOT a finished score:
-    {turn index: {"_chunk_probs": [[class_probs, token_count], ...]}} - `merge_partials` pools every
-    shard's list for that turn and finalises them together once all have landed."""
+    """Scores one chunk-level shard (transformer backend only); returns an unfinished partial for merge_partials to pool."""
     if getattr(scorer, "backend_name", None) != "transformer":
         raise ValueError(f"Chunk-level shards need the transformer backend, got {scorer.backend_name!r}.")
     class_probs = scorer._class_probs_batch([c for c, _ in chunks], [n for _, n in chunks])
@@ -192,10 +171,7 @@ def decode_partial(payload: dict) -> dict:
 
 
 def merge_partials(partials: dict) -> dict:
-    """Unions {shard index: {turn index: payload}} into one {turn index: score}. A payload is
-    normally a finished score; for an oversized turn split into chunk-level shards it is instead
-    `{"_chunk_probs": [...]}` - pooled across every shard covering that turn and finalised together
-    (same formula as scoring it whole, via `sentiment_model.finalize_chunk_probs`) once all have landed."""
+    """Unions {shard index: {turn index: payload}} into {turn index: score}, finalizing pooled chunk partials."""
     merged, raw_by_turn = {}, {}
     for shard_scores in partials.values():
         for turn_index, payload in shard_scores.items():

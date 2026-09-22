@@ -4,12 +4,8 @@ import dataclasses
 import math
 import os
 
-# Messages per ReceiveMessage, kept at 1: with 5, one worker hoarded the biggest tasks and runs were 16-28% slower;
-# with 1 they were 1.4-1.5x faster (NOTES.md 6.1).
-RECEIVE_BATCH_SIZE = 1
-# Expected slowest task (s), sizing the visibility timeout; only a starting window since keep_alive extends it,
-# so it really bounds how long a crashed worker's message stays hidden.
-WORST_CASE_TASK_SECONDS = 6
+RECEIVE_BATCH_SIZE = 1  # kept at 1: batch 5 hoarded big tasks and was slower (NOTES.md 6.1)
+WORST_CASE_TASK_SECONDS = 6  # expected slowest task (s); sizes the visibility timeout starting window
 
 
 def worst_case_visibility_timeout(receive_batch_size: int, worst_case_task_seconds: float) -> int:
@@ -23,8 +19,7 @@ def _env(name: str, default: str) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class AwsConfig:
-    # default_factory so each AwsConfig() reads the current env; a falsy endpoint_url means real AWS.
-    endpoint_url: str | None = dataclasses.field(
+    endpoint_url: str | None = dataclasses.field(  # falsy = real AWS
         default_factory=lambda: _env("AWS_ENDPOINT_URL", "http://localhost:4566"))
     region: str = dataclasses.field(default_factory=lambda: _env("AWS_REGION", "us-east-1"))
 
@@ -36,20 +31,21 @@ class AwsConfig:
     queue_name: str = dataclasses.field(default_factory=lambda: _env("SENTIMENT_QUEUE_NAME", "sentiment-work"))
     dead_letter_queue_name: str = dataclasses.field(
         default_factory=lambda: _env("SENTIMENT_DLQ_NAME", "sentiment-work-dlq"))
-    # after this many failed receives, SQS's redrive policy moves it to the DLQ
-    max_receive_count: int = dataclasses.field(
+    max_receive_count: int = dataclasses.field(  # after this many failed receives, SQS redrives to the DLQ
         default_factory=lambda: int(_env("SENTIMENT_MAX_RECEIVE_COUNT", "3")))
     receive_batch_size: int = dataclasses.field(
         default_factory=lambda: int(_env("SENTIMENT_RECEIVE_BATCH", str(RECEIVE_BATCH_SIZE))))
     worst_case_task_seconds: float = dataclasses.field(
         default_factory=lambda: float(_env("SENTIMENT_WORST_TASK_SECONDS", str(WORST_CASE_TASK_SECONDS))))
-    # Derived from the two fields above when unset (worst_case_visibility_timeout); env var or argument overrides.
-    visibility_timeout_seconds: int | None = dataclasses.field(
+    visibility_timeout_seconds: int | None = dataclasses.field(  # derived when unset; env var/argument overrides
         default_factory=lambda: int(os.environ["SENTIMENT_VISIBILITY_TIMEOUT"])
         if "SENTIMENT_VISIBILITY_TIMEOUT" in os.environ else None)
 
     ledger_table_name: str = dataclasses.field(
         default_factory=lambda: _env("SENTIMENT_LEDGER_TABLE", "sentiment-result-index"))
+
+    shard_expiry_days: int = dataclasses.field(  # only thing that reclaims S3ShardStore's slices/shards
+        default_factory=lambda: int(_env("SENTIMENT_SHARD_EXPIRY_DAYS", "7")))
 
     def __post_init__(self):
         if self.visibility_timeout_seconds is None:
@@ -60,8 +56,7 @@ class AwsConfig:
         kwargs = {"region_name": self.region}
         if self.endpoint_url:
             kwargs["endpoint_url"] = self.endpoint_url
-            # LocalStack ignores these, but boto3 needs some credentials -
-            # "test"/"test" is LocalStack's own documented convention
+            # LocalStack ignores these but boto3 needs some; "test"/"test" is LocalStack's own convention
             kwargs["aws_access_key_id"] = os.environ.get("AWS_ACCESS_KEY_ID", "test")
             kwargs["aws_secret_access_key"] = os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
         return kwargs

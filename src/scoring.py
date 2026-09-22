@@ -6,9 +6,9 @@ import json
 from datetime import datetime, timezone
 
 from src import conversation as conv
-from src.metrics import DEFAULT_WEIGHTING, compute_overall_sentiment, compute_sentiment_trajectory
+from src.metrics import DEFAULT_WEIGHTING, compute_overall_sentiment, compute_sentiment_trajectory, compute_volatility
 
-SCHEMA_VERSION = "1.1"  # 1.1: per-turn `n_chunks`
+SCHEMA_VERSION = "1.2"  # 1.1: per-turn `n_chunks`. 1.2: `metrics.volatility`
 
 
 def result_key(tenant_id: str, conversation_id: str) -> str:
@@ -16,8 +16,7 @@ def result_key(tenant_id: str, conversation_id: str) -> str:
 
 
 def extract_identity(raw_doc):
-    """Returns (tenant_id, conversation_id) or (None, None) if either is
-    missing - a record we cannot even key, let alone score."""
+    """(tenant_id, conversation_id), or (None, None) if either is missing."""
     if not isinstance(raw_doc, dict):
         return None, None
     return raw_doc.get("tenant_id"), raw_doc.get("conversation_id")
@@ -50,8 +49,7 @@ def score_turns(turn_results, scorer, indices=None) -> dict:
 def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer, source_ref,
                         scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING,
                         turn_scores: dict | None = None) -> dict:
-    """Builds the output record for a validated conversation; a fixed `scored_at` gives byte-identical reruns,
-    `turn_scores` supplies precomputed (merged shard) scores instead of scoring here, `source_ref` is the provenance pointer."""
+    """Builds the output record; `turn_scores` supplies precomputed shard scores, `source_ref` is the provenance pointer."""
     if turn_scores is None:
         turn_scores = score_turns(turn_results, scorer)
 
@@ -113,22 +111,20 @@ def score_conversation(raw_doc, tenant_id, conversation_id, turn_results, scorer
             "name": scorer.model_name,
             "revision": scorer.model_revision,
             "neutral_threshold": scorer.neutral_threshold,
-            # Recorded for provenance, same reasoning as neutral_threshold -
-            # see src/metrics.py for what "equal" vs "confidence" means.
-            "weighting": weighting,
+            "weighting": weighting,  # recorded for provenance - see src/metrics.py
         },
         "turns": scored_turns,
         "metrics": {
             "overall_sentiment": compute_overall_sentiment(customer_scores_unordered, weighting=weighting),
             "sentiment_trajectory": compute_sentiment_trajectory(ordered_scores),
+            "volatility": compute_volatility(ordered_scores),
         },
     }
 
 
 def evaluate(raw_doc, scorer, source_ref, scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING,
              turn_scores: dict | None = None):
-    """Validates then scores one raw document: ("dead_letter", reason) or ("ok", tenant_id, conversation_id, record).
-    Idempotency and persistence stay with the caller; `scored_at` / `turn_scores` as in score_conversation."""
+    """Validates then scores one raw document: ("dead_letter", reason) or ("ok", tenant_id, conversation_id, record)."""
     tenant_id, conversation_id = extract_identity(raw_doc)
     if not tenant_id or not conversation_id:
         return ("dead_letter", "missing_tenant_id_or_conversation_id")

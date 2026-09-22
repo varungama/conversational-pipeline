@@ -104,9 +104,7 @@ def main():
     turn_counts = sorted((len(d["turns"]) for d in docs), reverse=True)
     print(f"   turns per conversation, largest first: {turn_counts[:6]} ... median {statistics.median(turn_counts):.0f}")
     count_tokens = load_token_counter()  # shards are planned with token counts, as run.py does
-    # Same chunker run.py wires in, so an oversized turn shards by chunk here too - otherwise
-    # this simulation would still reflect the old one-giant-unsplittable-shard behaviour.
-    chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None
+    chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None  # same chunker run.py wires in
     memo = {}
 
     def measure(doc, start, end):
@@ -123,8 +121,7 @@ def main():
         return memo[key]
 
     def tasks_at(size):
-        """What the queue would hold if conversations over `size` turns were sharded:
-        [(cost, seconds, conversation_id, shard_index or None), ...] in file order."""
+        """What the queue would hold if conversations over `size` turns were sharded, in file order."""
         out = []
         for d in docs:
             shards, cost = plan_shards_and_cost(d, max_cost=size, count_tokens=count_tokens,

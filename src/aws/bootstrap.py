@@ -25,6 +25,24 @@ def ensure_bucket(clients: AwsClients, name: str):
         _ignore_already_exists(exc, "BucketAlreadyOwnedByYou", "BucketAlreadyExists")
 
 
+def ensure_shard_lifecycle(clients: AwsClients, bucket: str, expiry_days: int):
+    """Expires `slices/` and `shards/` (S3ShardStore) after `expiry_days`; idempotent overwrite."""
+    clients.s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [
+                {
+                    "ID": f"expire-{prefix.rstrip('/')}",
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": prefix},
+                    "Expiration": {"Days": expiry_days},
+                }
+                for prefix in ("slices/", "shards/")
+            ],
+        },
+    )
+
+
 def ensure_queue(clients: AwsClients, name: str, attributes: dict | None = None) -> str:
     """Returns the queue URL, creating the queue if needed."""
     try:
@@ -54,10 +72,10 @@ def ensure_ledger_table(clients: AwsClients, table_name: str):
 
 
 def ensure_infrastructure(clients: AwsClients, config: AwsConfig) -> dict:
-    """Creates everything and returns the resource identifiers callers need
-    (queue URLs, ARNs) so they're not re-derived elsewhere."""
+    """Creates everything and returns the resource identifiers callers need (queue URLs, ARNs)."""
     ensure_bucket(clients, config.conversations_bucket)
     ensure_bucket(clients, config.results_bucket)
+    ensure_shard_lifecycle(clients, config.conversations_bucket, config.shard_expiry_days)
 
     dlq_url = ensure_queue(clients, config.dead_letter_queue_name)
     dlq_arn = clients.sqs.get_queue_attributes(

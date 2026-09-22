@@ -27,21 +27,16 @@ class AwsWorker:
         shard_store: S3ShardStore | None = None,
     ):
         self.queue = queue
-        # Only needed when sharded messages are in play.
-        self.shard_store = shard_store
+        self.shard_store = shard_store  # only needed when sharded messages are in play
         self.conversation_store = conversation_store
         self.result_store = result_store
         self.ledger = ledger
         self.scorer = scorer
-        # Same byte-identical-rerun knob as the local Worker - see
-        # src/scoring.py and src/worker.py.
-        self.scored_at = scored_at
-        # Same equal-vs-confidence knob as the local Worker, so both transports compute identical metrics.
-        self.weighting = weighting
+        self.scored_at = scored_at  # byte-identical-rerun knob, same as the local Worker
+        self.weighting = weighting  # equal-vs-confidence knob, same as the local Worker
 
     def run_once(self, max_messages: int = RECEIVE_BATCH_SIZE) -> dict:
-        """Processes one receive batch; returns counts by outcome (`left_for_retry` = left un-acked for SQS to redeliver).
-        `shards_scored` = shards that only parked a partial; the merging shard counts as `processed`."""
+        """Processes one receive batch; returns counts by outcome. `shards_scored` = parked partials, not the merge."""
         summary = {"processed": 0, "skipped_duplicate": 0, "left_for_retry": 0, "shards_scored": 0}
         for message in self.queue.receive_batch(max_messages=max_messages):
             outcome = self._process_one(message)
@@ -49,9 +44,7 @@ class AwsWorker:
         return summary
 
     def _process_one(self, message: Message) -> str:
-        # Held invisible for as long as this takes, so a slow task is never
-        # redelivered mid-flight (see SqsQueue.keep_alive).
-        with self.queue.keep_alive(message):
+        with self.queue.keep_alive(message):  # held invisible so a slow task is never redelivered mid-flight
             return self._handle(message)
 
     def _handle(self, message: Message) -> str:
@@ -71,18 +64,17 @@ class AwsWorker:
                 self.queue.ack(message)
                 return "skipped_duplicate"
             try:
-                # Only this shard's slice is read; the whole document is
-                # fetched below, once per conversation, by the merging shard.
-                slice_data = self.shard_store.get_slice(tenant_id, conversation_id, shard["index"])
+                # only this shard's slice is read; the merging shard fetches the whole doc below
+                plan_hash = shard["plan_hash"]
+                slice_data = self.shard_store.get_slice(tenant_id, conversation_id, plan_hash, shard["index"])
                 partial = (score_chunk_shard(slice_data, shard, self.scorer) if is_chunk_shard(shard)
                           else score_shard(slice_data, shard, self.scorer))
-                self.shard_store.put(tenant_id, conversation_id, shard["index"], partial)
-                # Atomic: exactly one shard's call here returns True, however many land at once
-                # (DynamoResultIndex.mark_shard_landed) - that shard, and only that one, merges.
-                if not self.ledger.mark_shard_landed(key, shard["index"], shard["count"]):
+                self.shard_store.put(tenant_id, conversation_id, plan_hash, shard["index"], partial)
+                # atomic: exactly one shard's call here returns True, however many land at once
+                if not self.ledger.mark_shard_landed(key, plan_hash, shard["index"], shard["count"]):
                     self.queue.ack(message)  # partial is durable; the shard that completes the set does the merge
                     return "shards_scored"
-                turn_scores = merge_partials(self.shard_store.load(tenant_id, conversation_id))
+                turn_scores = merge_partials(self.shard_store.load(tenant_id, conversation_id, plan_hash))
             except Exception:
                 logger.exception("Unexpected error scoring shard %s of %s - will retry / eventually DLQ.",
                                  shard.get("index"), key)
@@ -91,8 +83,7 @@ class AwsWorker:
         return self._finish(message, tenant_id, conversation_id, turn_scores)
 
     def _finish(self, message: Message, tenant_id: str, conversation_id: str, turn_scores) -> str:
-        """Builds and stores the result record. `turn_scores` is the merged
-        partials of a sharded conversation, or None to score it whole here."""
+        """Builds and stores the result record; `turn_scores` is merged partials, or None to score it whole here."""
         key = result_key(tenant_id, conversation_id)
         source_ref = f"{tenant_id}/{conversation_id}.json"
 

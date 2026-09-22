@@ -22,10 +22,8 @@ class Worker:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.scorer = scorer
         self.index = ResultIndex(results_dir / "index.json")
-        # Overrides every record's `scored_at` for byte-identical reruns (see src/scoring.py).
-        self.scored_at = scored_at
-        # "equal" or "confidence" - see src/metrics.py, compute_overall_sentiment.
-        self.weighting = weighting
+        self.scored_at = scored_at  # overrides `scored_at` for byte-identical reruns (src/scoring.py)
+        self.weighting = weighting  # "equal" or "confidence" - see src/metrics.py
 
     def run_once(self) -> dict:
         """Processes everything currently pending. Returns counts by outcome."""
@@ -45,9 +43,7 @@ class Worker:
             self.queue.mark_dead(path, f"unreadable_json: {exc}")
             return "dead_lettered"
 
-        # Peek at identity before scoring, purely so a duplicate delivery
-        # can be recognised and skipped without paying for model inference.
-        tenant_id = raw_doc.get("tenant_id") if isinstance(raw_doc, dict) else None
+        tenant_id = raw_doc.get("tenant_id") if isinstance(raw_doc, dict) else None  # peek at identity to skip duplicates cheaply
         conversation_id = raw_doc.get("conversation_id") if isinstance(raw_doc, dict) else None
         if tenant_id and conversation_id and self.index.has(result_key(tenant_id, conversation_id)):
             logger.info("Duplicate delivery for %s::%s (source file %s) - skipping.",
@@ -55,8 +51,7 @@ class Worker:
             self.queue.mark_done(path)
             return "skipped_duplicate"
 
-        # The model can throw on unforeseen input; dead-letter that conversation instead of failing the batch.
-        try:
+        try:  # the model can throw on unforeseen input; dead-letter it instead of failing the batch
             outcome = evaluate(raw_doc, self.scorer, source_ref=path.name, scored_at=self.scored_at,
                                 weighting=self.weighting)
         except Exception as exc:
@@ -73,9 +68,7 @@ class Worker:
         key = result_key(tenant_id, conversation_id)
         out_path = self.results_dir / f"{tenant_id}__{conversation_id}.json"
 
-        # The earlier check is only an optimisation; try_claim is the real mutual exclusion,
-        # so when worker processes race only one persists a result.
-        if not self.index.try_claim(key, out_path.name):
+        if not self.index.try_claim(key, out_path.name):  # earlier check is an optimization; this is the real mutual exclusion
             logger.info("Duplicate delivery for %s::%s (source file %s) - skipping.",
                         tenant_id, conversation_id, path.name)
             self.queue.mark_done(path)

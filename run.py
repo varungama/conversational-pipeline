@@ -166,9 +166,7 @@ def run_aws(args):
 
     count_tokens = load_token_counter(args.model)  # None -> costs are estimated from characters
     logger.info("Estimating task cost from %s", "tokenizer token counts" if count_tokens else "character counts")
-    # Same chunker the scorer itself uses (src/sentiment_model.py), bound to this run's tokenizer, so an
-    # oversized single turn can be split into chunk-level shards instead of staying one unsplittable task.
-    chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None
+    chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None  # enables chunk-level shards
 
     tasks = []  # (cost, tenant_id, conversation_id, shard or None)
     enqueued = 0

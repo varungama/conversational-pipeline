@@ -105,21 +105,29 @@ class TestAwsWorker(unittest.TestCase):
 
     def test_mark_shard_landed_is_true_only_once_the_set_is_complete(self):
         key = result_key("acme", "c-shardcount")
-        self.assertFalse(self.ledger.mark_shard_landed(key, 0, total=3))
-        self.assertFalse(self.ledger.mark_shard_landed(key, 1, total=3))
-        self.assertTrue(self.ledger.mark_shard_landed(key, 2, total=3))
+        self.assertFalse(self.ledger.mark_shard_landed(key, "ph", 0, total=3))
+        self.assertFalse(self.ledger.mark_shard_landed(key, "ph", 1, total=3))
+        self.assertTrue(self.ledger.mark_shard_landed(key, "ph", 2, total=3))
         # a completed conversation's own result claim is a separate item - unaffected
         self.assertFalse(self.ledger.has(key))
 
     def test_mark_shard_landed_is_idempotent_under_redelivery(self):
-        # a shard message delivered twice must not let two different indices both look
-        # "complete", and a redelivery of the completing shard must still say True (so SQS's
-        # own redelivery - not a lock - is what retries a merge that crashed after winning)
+        # a redelivery of the completing shard must still say True - SQS redelivery, not a lock, retries the merge
         key = result_key("acme", "c-shardcount-2")
-        self.assertFalse(self.ledger.mark_shard_landed(key, 0, total=2))
-        self.assertFalse(self.ledger.mark_shard_landed(key, 0, total=2))  # redelivered shard 0
-        self.assertTrue(self.ledger.mark_shard_landed(key, 1, total=2))
-        self.assertTrue(self.ledger.mark_shard_landed(key, 1, total=2))  # redelivered shard 1 (the winner)
+        self.assertFalse(self.ledger.mark_shard_landed(key, "ph", 0, total=2))
+        self.assertFalse(self.ledger.mark_shard_landed(key, "ph", 0, total=2))  # redelivered shard 0
+        self.assertTrue(self.ledger.mark_shard_landed(key, "ph", 1, total=2))
+        self.assertTrue(self.ledger.mark_shard_landed(key, "ph", 1, total=2))  # redelivered shard 1 (the winner)
+
+    def test_mark_shard_landed_is_scoped_to_its_plan_hash(self):
+        # a stale/leftover plan's shard count must never complete against a different plan's set
+        key = result_key("acme", "c-shardcount-replanned")
+        self.assertFalse(self.ledger.mark_shard_landed(key, "old-plan", 0, total=2))
+        # shard 0 of a *new* plan (e.g. a rerun with a different --model) starts its own, separate set
+        self.assertFalse(self.ledger.mark_shard_landed(key, "new-plan", 0, total=2))
+        self.assertTrue(self.ledger.mark_shard_landed(key, "new-plan", 1, total=2))
+        # the old plan's set is still incomplete and unaffected by the new plan's completion
+        self.assertFalse(self.ledger.mark_shard_landed(key, "old-plan", 0, total=2))  # redelivered, still 1 of 2
 
     def test_mark_shard_landed_has_exactly_one_winner_under_real_concurrency(self):
         # every shard "lands" from its own thread at once - the scenario in the finding this
@@ -129,7 +137,7 @@ class TestAwsWorker(unittest.TestCase):
         results = [None] * total
 
         def land(i):
-            results[i] = self.ledger.mark_shard_landed(key, i, total)
+            results[i] = self.ledger.mark_shard_landed(key, "ph", i, total)
 
         threads = [threading.Thread(target=land, args=(i,)) for i in range(total)]
         for t in threads:
@@ -192,10 +200,35 @@ class TestAwsWorker(unittest.TestCase):
         self.assertEqual(again["skipped_duplicate"], 1)
         self.assertEqual(len(self.results.list_all()), 1)
 
+    def test_replanned_shards_never_merge_with_a_stale_plans_leftovers(self):
+        # a stale, never-completed plan's leftover partial must not merge into a differently-shaped rerun
+        turns = [{"seq": i, "role": "customer", "ts": f"2026-03-02T09:{i // 60:02d}:{i % 60:02d}Z",
+                  "text": ["GOOD", "BAD", "MEH"][i % 3] + " " * 40} for i in range(120)]
+        doc = {"conversation_id": "c-replan", "tenant_id": "acme", "channel": "chat", "turns": turns}
+        self.conversations.put("acme", "c-replan", doc)
+
+        stale_shards = plan_shards(doc, max_cost=1500)
+        self.shard_store.put_slices("acme", "c-replan", doc, stale_shards)
+        self.queue.enqueue("acme", "c-replan", shard=stale_shards[0])  # only this one ever lands
+        self.worker.run_once()
+        self.assertEqual(self.results.list_all(), [])  # incomplete - nothing merged
+
+        fresh_shards = plan_shards(doc, max_cost=3500)
+        self.assertNotEqual(stale_shards[0]["plan_hash"], fresh_shards[0]["plan_hash"])
+        self.shard_store.put_slices("acme", "c-replan", doc, fresh_shards)
+        for shard in fresh_shards:
+            self.queue.enqueue("acme", "c-replan", shard=shard)
+        while self.queue.approximate_depth() > 0:
+            self.worker.run_once()
+
+        results = self.results.list_all()
+        self.assertEqual(len(results), 1)
+        expected = evaluate(doc, StubScorer(), "acme/c-replan.json")[3]
+        expected["scored_at"] = results[0]["scored_at"]
+        self.assertEqual(results[0], expected)
+
     def test_shards_that_finish_simultaneously_still_merge_exactly_once(self):
-        # every shard lands "at the same time" - separate worker instances, separate threads,
-        # each doing its own S3 put + ledger update concurrently, the exact scenario the
-        # mark_shard_landed fix targets (two-shards-finish-simultaneously)
+        # every shard lands "at the same time" from its own worker instance and thread
         turns = [{"seq": i, "role": "customer", "ts": f"2026-03-02T09:{i // 60:02d}:{i % 60:02d}Z",
                   "text": ["GOOD", "BAD", "MEH"][i % 3] + " " * 40} for i in range(120)]
         doc = {"conversation_id": "c-race", "tenant_id": "acme", "channel": "chat", "turns": turns}

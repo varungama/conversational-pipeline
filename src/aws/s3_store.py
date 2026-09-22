@@ -31,26 +31,22 @@ class S3ConversationStore:
 
 
 class S3ShardStore:
-    """Sharded-conversation data in the conversations bucket: `slices/` (each shard's turns, written once) and `shards/` (partial scores).
-    Nothing deletes them; add an S3 lifecycle expiry on both prefixes."""
+    """Sharded-conversation data: `slices/` (turns) and `shards/` (partials), scoped by `plan_hash`; expired via bootstrap.ensure_shard_lifecycle."""
 
     def __init__(self, clients: AwsClients, bucket: str):
         self.s3 = clients.s3
         self.bucket = bucket
 
     @staticmethod
-    def _prefix(tenant_id: str, conversation_id: str) -> str:
-        return f"shards/{tenant_id}/{conversation_id}/"
+    def _prefix(tenant_id: str, conversation_id: str, plan_hash: str) -> str:
+        return f"shards/{tenant_id}/{conversation_id}/{plan_hash}/"
 
     @staticmethod
-    def _slice_key(tenant_id: str, conversation_id: str, index: int) -> str:
-        return f"slices/{tenant_id}/{conversation_id}/{index:05d}.json"
+    def _slice_key(tenant_id: str, conversation_id: str, plan_hash: str, index: int) -> str:
+        return f"slices/{tenant_id}/{conversation_id}/{plan_hash}/{index:05d}.json"
 
     def put_slices(self, tenant_id: str, conversation_id: str, raw_doc: dict, shards: list, chunk_text_fn=None):
-        """Stores each shard's turns (or, for a chunk-level shard, that turn's own chunk texts -
-        `chunk_text_fn` is required if any shard is one). Call before enqueueing the shards.
-        An oversized turn is re-chunked once here (cached by turn index), not once per
-        chunk-shard covering it - several shards can share one turn."""
+        """Stores each shard's turns (or chunk texts); call before enqueueing. `chunk_text_fn` required if any shard is chunk-level."""
         chunks_by_turn = {}
         for shard in shards:
             if is_chunk_shard(shard):
@@ -62,36 +58,36 @@ class S3ShardStore:
                 payload = slice_turns(raw_doc, shard)
             self.s3.put_object(
                 Bucket=self.bucket,
-                Key=self._slice_key(tenant_id, conversation_id, shard["index"]),
+                Key=self._slice_key(tenant_id, conversation_id, shard["plan_hash"], shard["index"]),
                 Body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 ContentType="application/json",
             )
 
-    def get_slice(self, tenant_id: str, conversation_id: str, index: int) -> list:
-        obj = self.s3.get_object(Bucket=self.bucket, Key=self._slice_key(tenant_id, conversation_id, index))
+    def get_slice(self, tenant_id: str, conversation_id: str, plan_hash: str, index: int) -> list:
+        obj = self.s3.get_object(Bucket=self.bucket, Key=self._slice_key(tenant_id, conversation_id, plan_hash, index))
         return json.loads(obj["Body"].read().decode("utf-8"))
 
-    def put(self, tenant_id: str, conversation_id: str, index: int, scores: dict):
+    def put(self, tenant_id: str, conversation_id: str, plan_hash: str, index: int, scores: dict):
         self.s3.put_object(
             Bucket=self.bucket,
-            Key=f"{self._prefix(tenant_id, conversation_id)}{index:05d}.json",
+            Key=f"{self._prefix(tenant_id, conversation_id, plan_hash)}{index:05d}.json",
             Body=json.dumps(encode_partial(scores), ensure_ascii=False).encode("utf-8"),
             ContentType="application/json",
         )
 
-    def _keys(self, tenant_id: str, conversation_id: str) -> dict:
+    def _keys(self, tenant_id: str, conversation_id: str, plan_hash: str) -> dict:
         keys = {}
         paginator = self.s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._prefix(tenant_id, conversation_id)):
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._prefix(tenant_id, conversation_id, plan_hash)):
             for obj in page.get("Contents", []):
                 keys[int(obj["Key"].rsplit("/", 1)[1][:-len(".json")])] = obj["Key"]
         return keys
 
-    def load(self, tenant_id: str, conversation_id: str) -> dict:
-        """{shard index: {turn index: score dict}}"""
+    def load(self, tenant_id: str, conversation_id: str, plan_hash: str) -> dict:
+        """{shard index: {turn index: score dict}}, scoped to one plan's shards."""
         return {
             index: decode_partial(json.loads(self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()))
-            for index, key in self._keys(tenant_id, conversation_id).items()
+            for index, key in self._keys(tenant_id, conversation_id, plan_hash).items()
         }
 
 
@@ -111,7 +107,7 @@ class S3ResultStore:
         )
 
     def list_all(self) -> list:
-        """Returns every scored record; fine for a demo, use an index (Athena, a database) at real volume."""
+        """Every scored record; fine for a demo, use an index (Athena, a database) at real volume."""
         records = []
         paginator = self.s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket):

@@ -1,5 +1,4 @@
-"""boto3 client construction, in one place so tests point every client at
-moto the same way run.py points them at LocalStack."""
+"""boto3 client construction, in one place so tests point every client at moto like run.py points at LocalStack."""
 
 import boto3
 

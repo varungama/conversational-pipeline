@@ -1,5 +1,4 @@
-"""SQS as the work queue: receive = claim; un-acked messages reappear after the visibility timeout and go to the DLQ
-after `maxReceiveCount` attempts (no app code). The DLQ carries no reason; it lives in the worker logs."""
+"""SQS as the work queue: receive = claim; un-acked messages redeliver, then go to the DLQ after `maxReceiveCount`."""
 
 import contextlib
 import json
@@ -23,8 +22,7 @@ class SqsQueue:
         self.sqs = clients.sqs
         self.queue_url = queue_url
         self.dlq_url = dlq_url
-        # The queue's visibility timeout, needed only by `keep_alive`.
-        self.visibility_timeout_seconds = visibility_timeout_seconds
+        self.visibility_timeout_seconds = visibility_timeout_seconds  # needed only by `keep_alive`
 
     def enqueue(self, tenant_id: str, conversation_id: str, shard: dict | None = None):
         """Sends a pointer, not the transcript; `shard` selects one slice of a large conversation."""
@@ -46,14 +44,12 @@ class SqsQueue:
         ]
 
     def ack(self, message: Message):
-        """Deletes the message - fully done, never redeliver. Used for both
-        a scored conversation and a recognised duplicate; both finished."""
+        """Deletes the message - fully done, never redeliver."""
         self.sqs.delete_message(QueueUrl=self.queue_url, ReceiptHandle=message.receipt_handle)
 
     @contextlib.contextmanager
     def keep_alive(self, message: Message):
-        """Keeps `message` invisible while the caller works, re-extending the timeout every third of it.
-        So the timeout only bounds a crashed worker's message, not the slowest task; no-op without a timeout."""
+        """Keeps `message` invisible while the caller works, re-extending the timeout every third of it."""
         timeout = self.visibility_timeout_seconds
         if not timeout:
             yield

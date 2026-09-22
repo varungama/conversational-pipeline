@@ -1,5 +1,4 @@
-"""Durable file queue (pending/ processing/ done/ dead_letter/); a claim is one atomic os.rename.
-No visibility timeout by design: a crashed worker's file stays in processing/ until someone looks."""
+"""Durable file queue (pending/processing/done/dead_letter); a claim is one atomic os.rename, no visibility timeout."""
 
 import os
 import pathlib
@@ -17,8 +16,7 @@ class FileQueue:
             directory.mkdir(parents=True, exist_ok=True)
 
     def enqueue(self, source_path: pathlib.Path) -> pathlib.Path:
-        """Copies a conversation file into pending/, leaving the source
-        untouched so re-running against the same input is safe."""
+        """Copies a conversation file into pending/, leaving the source untouched."""
         target = self.pending / source_path.name
         shutil.copy2(source_path, target)
         return target
@@ -27,8 +25,7 @@ class FileQueue:
         return sorted(self.pending.glob("*.json"))
 
     def claim(self, path: pathlib.Path):
-        """Atomically moves a pending file into processing/. Returns the new
-        path, or None if another worker claimed it first."""
+        """Atomically moves a pending file into processing/; None if another worker claimed it first."""
         target = self.processing / path.name
         try:
             os.rename(path, target)

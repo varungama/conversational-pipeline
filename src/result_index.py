@@ -1,5 +1,4 @@
-"""A tiny durable, lock-protected JSON ledger, keyed by "tenant_id::conversation_id", that lets `try_claim` give
-exactly one worker process the right to record a given conversation's result."""
+"""Durable, lock-protected JSON ledger keyed by "tenant_id::conversation_id"; `try_claim` picks exactly one claimant."""
 
 import json
 import os

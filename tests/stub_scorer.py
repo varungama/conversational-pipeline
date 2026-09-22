@@ -18,8 +18,7 @@ class StubScorer:
 
 
 class BatchStubScorer(StubScorer):
-    """StubScorer with `score_batch`, recording each batch's size so tests
-    can assert a conversation is scored in one call."""
+    """StubScorer with `score_batch`, recording each batch's size."""
 
     def __init__(self):
         self.batch_sizes = []
@@ -35,11 +34,7 @@ def word_count(text: str) -> int:
 
 
 class FakeChunkScorer(SentimentScorer):
-    """Real `score` / chunking / aggregation (SentimentScorer's own), fake model: a chunk is
-    positive if it contains 'good' and not 'not good', else negative. `backend_name` is
-    "transformer" and `_class_probs_batch` is implemented, so this also exercises the
-    chunk-level sharding path (src/sharding.py's score_chunk_shard/merge_partials), not just
-    SentimentScorer.score_batch."""
+    """Real chunking/aggregation, fake model: positive if 'good' and not 'not good'. Exercises chunk-level sharding too."""
 
     def __init__(self):  # skip model loading
         self.backend_name = "transformer"

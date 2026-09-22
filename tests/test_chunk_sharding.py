@@ -1,6 +1,4 @@
-"""Chunk-level sharding: an oversized single turn split at the model's own chunk boundaries
-(src/sentiment_model.chunk_text) instead of staying one unsplittable shard. The promise under
-test is the same one whole-turn sharding makes: sharded and unsharded scoring must agree exactly."""
+"""Chunk-level sharding: an oversized turn split at chunk boundaries; sharded and unsharded scoring must agree exactly."""
 
 import functools
 import unittest

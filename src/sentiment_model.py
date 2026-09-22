@@ -31,14 +31,12 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？])|(?<=[.!?])(?=\s)|(?<=\n)")
 
 
 def split_sentences(text: str) -> list[str]:
-    """Splits on sentence boundaries without dropping or altering any
-    character: `"".join(split_sentences(t)) == t`."""
+    """Splits on sentence boundaries, lossless: `"".join(split_sentences(t)) == t`."""
     return [part for part in _SENTENCE_BOUNDARY.split(text) if part]
 
 
 def _hard_split(piece: str, count_tokens, limit: int) -> list[str]:
-    """Last resort for a single sentence that alone exceeds `limit`: halve it
-    by characters until every part fits. Deterministic; may cut mid-word."""
+    """Last resort for a sentence over `limit`: halve by characters until every part fits; may cut mid-word."""
     if len(piece) <= 1 or count_tokens(piece) <= limit:
         return [piece]
     mid = len(piece) // 2
@@ -59,9 +57,7 @@ def chunk_text(text: str, count_tokens, limit: int = CHUNK_TOKEN_LIMIT) -> list[
     chunks, current, current_tokens = [], "", 0
     for piece in pieces:
         n = count_tokens(piece)
-        # Token counts of adjacent pieces are near-additive; re-check the
-        # joined text for exactness instead of trusting the sum.
-        if current and count_tokens(current + piece) > limit:
+        if current and count_tokens(current + piece) > limit:  # re-check joined text, don't trust the sum
             chunks.append((current, current_tokens))
             current = ""
         current += piece
@@ -79,30 +75,25 @@ def aggregate_probs(chunk_probs: list[tuple[dict, int]]) -> dict:
 
 
 def finalize_chunk_probs(chunk_probs: list[tuple[dict, int]]):
-    """(signed_score, confidence, label, n_chunks) for one text from its chunks' (class_probs, token_count)
-    pairs. Shared by score_batch and sharding.merge_partials (an oversized turn split across shards),
-    so the two paths cannot derive different numbers from the same chunk probabilities."""
+    """(signed_score, confidence, label, n_chunks) from chunks' (class_probs, token_count); shared by score_batch and merge_partials."""
     probs = chunk_probs[0][0] if len(chunk_probs) == 1 else aggregate_probs(chunk_probs)
     label, confidence = max(probs.items(), key=lambda kv: kv[1])
     signed_score = probs.get("positive", 0.0) - probs.get("negative", 0.0)
     return signed_score, confidence, label, len(chunk_probs)
 
 
-# Caps on one forward pass: batches are limited by padded tokens (items x longest) as well as item count,
-# or a few ~400-token chunks pad 30 short ones to 400 (measured: 56s for one batch).
+# Caps on one forward pass: batches limited by padded tokens (items x longest) as well as item count
 BATCH_SIZE = 32
 MAX_BATCH_TOKENS = 512
 
 
 def length_sorted_batches(lengths: list[int], batch_size: int = BATCH_SIZE,
                           max_tokens: int = MAX_BATCH_TOKENS) -> list[list[int]]:
-    """Groups item indices into length-sorted batches capped by `batch_size` and padded size (items x longest) `max_tokens`;
-    ties break by index, and an over-budget item gets its own batch."""
+    """Length-sorted batches capped by `batch_size` and padded size `max_tokens`; an over-budget item gets its own batch."""
     order = sorted(range(len(lengths)), key=lambda i: (-lengths[i], i))
     batches, current = [], []
     for i in order:
-        # `order` is longest-first, so the batch's first item sets its padded width
-        if current and (len(current) >= batch_size or (len(current) + 1) * lengths[current[0]] > max_tokens):
+        if current and (len(current) >= batch_size or (len(current) + 1) * lengths[current[0]] > max_tokens):  # longest-first: current[0] sets padded width
             batches.append(current)
             current = []
         current.append(i)
@@ -185,8 +176,7 @@ class SentimentScorer:
         return len(self._pipeline.tokenizer(text, add_special_tokens=False)["input_ids"])
 
     def _class_probs_batch(self, chunks: list[str], lengths: list[int]) -> list[dict]:
-        """Class probabilities for each chunk, in input order. `lengths` are
-        the chunks' token counts, used only to group similar lengths."""
+        """Class probabilities for each chunk, in input order; `lengths` groups similar-length chunks together."""
         probs = [None] * len(chunks)
         for batch in length_sorted_batches(lengths, BATCH_SIZE, MAX_BATCH_TOKENS):  # module globals, read at call time
             results = self._pipeline([chunks[i] for i in batch], top_k=None, batch_size=len(batch))
