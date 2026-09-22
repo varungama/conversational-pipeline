@@ -16,7 +16,7 @@ from src import conversation as conv  # noqa: E402
 from src.aws.config import RECEIVE_BATCH_SIZE, worst_case_visibility_timeout  # noqa: E402
 from src.scoring import extract_identity  # noqa: E402
 from src.sentiment_model import chunk_text, load_token_counter  # noqa: E402
-from src.sharding import estimate_cost, is_chunk_shard, plan_shards, slice_chunk_texts  # noqa: E402
+from src.sharding import is_chunk_shard, plan_shards_and_cost, slice_chunk_texts  # noqa: E402
 
 DATA = pathlib.Path(__file__).resolve().parent.parent / "data" / "conversations"
 
@@ -127,13 +127,14 @@ def main():
         [(cost, seconds, conversation_id, shard_index or None), ...] in file order."""
         out = []
         for d in docs:
-            shards = plan_shards(d, max_cost=size, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
+            shards, cost = plan_shards_and_cost(d, max_cost=size, count_tokens=count_tokens,
+                                                chunk_text_fn=chunk_text_fn)
             if shards:
                 out += [(sh["cost"], measure_chunk_shard(d, sh) if is_chunk_shard(sh)
                         else measure(d, sh["start"], sh["end"]), d["conversation_id"], sh["index"])
                         for sh in shards]
             else:
-                out.append((estimate_cost(d, count_tokens), measure(d, 0, None), d["conversation_id"], None))
+                out.append((cost, measure(d, 0, None), d["conversation_id"], None))
         return out
 
     whole = tasks_at(10 ** 9)

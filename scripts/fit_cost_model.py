@@ -5,23 +5,13 @@ import argparse
 import json
 import pathlib
 import sys
-import time
 
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from scripts.benchmark import load_valid_docs, scorable_texts  # noqa: E402
+from scripts.benchmark import load_valid_docs, scorable_texts, timed  # noqa: E402
 from src.sentiment_model import SentimentScorer  # noqa: E402
-
-
-def best_time(fn, reps):
-    best = float("inf")
-    for _ in range(reps):
-        t = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t)
-    return best * 1000  # ms
 
 
 def slices(doc):
@@ -62,7 +52,7 @@ def main():
             raw = doc["turns"][start:end]
             rows.append((len(raw), sum(len(t) for t in texts),
                          sum(scorer._count_tokens(t) for t in texts),
-                         best_time(lambda t=texts: scorer.score_batch(t), args.reps)))
+                         timed(lambda t=texts: scorer.score_batch(t), args.reps) * 1000))  # ms
     print(f"{len(rows)} measurements\n")
 
     turns, chars, tokens, ms = (list(col) for col in zip(*rows))

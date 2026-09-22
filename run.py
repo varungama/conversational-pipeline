@@ -13,10 +13,23 @@ from src.conversation import parse_timestamp
 from src.metrics import DEFAULT_WEIGHTING, WEIGHTING_CHOICES
 from src.queue_store import FileQueue
 from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer, chunk_text, load_token_counter
-from src.sharding import estimate_cost, lpt_interleaved, plan_shards
+from src.sharding import lpt_interleaved, plan_shards_and_cost
 from src.worker import Worker
 
 logger = logging.getLogger(__name__)
+
+
+def _write_run_output(output_dir: pathlib.Path, combined: list, dead_letters: list, summary: dict):
+    """Shared tail of both backends: write results.json/errors.json and log the run summary."""
+    (output_dir / "results.json").write_text(
+        json.dumps(combined, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (output_dir / "errors.json").write_text(
+        json.dumps(dead_letters, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    logger.info("Run summary: %s", json.dumps(summary))
+    logger.info("Wrote %d scored conversation(s) to %s", len(combined), output_dir / "results.json")
+    logger.info("Wrote %d dead-lettered conversation(s) to %s", len(dead_letters), output_dir / "errors.json")
 
 
 def configure_logging(log_dir: pathlib.Path, suffix: str = "") -> pathlib.Path:
@@ -112,9 +125,6 @@ def run_local(args):
         if result_file.name == "index.json":
             continue
         combined.append(json.loads(result_file.read_text(encoding="utf-8")))
-    (output_dir / "results.json").write_text(
-        json.dumps(combined, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
 
     dead_letters = []
     for dead_file in sorted(queue.dead_letter.glob("*.json")):
@@ -123,13 +133,8 @@ def run_local(args):
             "source_file": dead_file.name,
             "reason": reason_file.read_text(encoding="utf-8") if reason_file.exists() else "unknown",
         })
-    (output_dir / "errors.json").write_text(
-        json.dumps(dead_letters, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
 
-    logger.info("Run summary: %s", json.dumps(summary))
-    logger.info("Wrote %d scored conversation(s) to %s", len(combined), output_dir / "results.json")
-    logger.info("Wrote %d dead-lettered conversation(s) to %s", len(dead_letters), output_dir / "errors.json")
+    _write_run_output(output_dir, combined, dead_letters, summary)
 
 
 def run_aws(args):
@@ -175,12 +180,12 @@ def run_aws(args):
             # No identity for an S3 key: upload under a synthetic key so it dead-letters through normal validation.
             tenant_id, conversation_id = "unknown", source_file.stem
         conversations.put(tenant_id, conversation_id, raw_doc)
-        shards = plan_shards(raw_doc, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
+        shards, cost = plan_shards_and_cost(raw_doc, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
         if shards:
             shard_store.put_slices(tenant_id, conversation_id, raw_doc, shards, chunk_text_fn)  # before enqueueing
             tasks.extend((shard["cost"], tenant_id, conversation_id, shard) for shard in shards)
         else:
-            tasks.append((estimate_cost(raw_doc, count_tokens), tenant_id, conversation_id, None))
+            tasks.append((cost, tenant_id, conversation_id, None))
         enqueued += 1
 
     # Longest-first, interleaved by receive batch size so one ReceiveMessage can't grab several big tasks at once.
@@ -218,18 +223,8 @@ def run_aws(args):
             idle_passes = 0
 
     dead_letters = worker.drain_dead_letters()
-
     combined = results_store.list_all()
-    (output_dir / "results.json").write_text(
-        json.dumps(combined, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    (output_dir / "errors.json").write_text(
-        json.dumps(dead_letters, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-
-    logger.info("Run summary: %s", json.dumps(summary))
-    logger.info("Wrote %d scored conversation(s) to %s", len(combined), output_dir / "results.json")
-    logger.info("Wrote %d dead-lettered conversation(s) to %s", len(dead_letters), output_dir / "errors.json")
+    _write_run_output(output_dir, combined, dead_letters, summary)
 
 
 def main():

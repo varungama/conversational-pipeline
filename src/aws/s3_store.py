@@ -3,7 +3,7 @@
 import json
 
 from src.aws.clients import AwsClients
-from src.sharding import decode_partial, encode_partial, is_chunk_shard, slice_chunk_texts, slice_turns
+from src.sharding import decode_partial, encode_partial, is_chunk_shard, slice_turns
 
 
 def _key(tenant_id: str, conversation_id: str) -> str:
@@ -48,10 +48,18 @@ class S3ShardStore:
 
     def put_slices(self, tenant_id: str, conversation_id: str, raw_doc: dict, shards: list, chunk_text_fn=None):
         """Stores each shard's turns (or, for a chunk-level shard, that turn's own chunk texts -
-        `chunk_text_fn` is required if any shard is one). Call before enqueueing the shards."""
+        `chunk_text_fn` is required if any shard is one). Call before enqueueing the shards.
+        An oversized turn is re-chunked once here (cached by turn index), not once per
+        chunk-shard covering it - several shards can share one turn."""
+        chunks_by_turn = {}
         for shard in shards:
-            payload = (slice_chunk_texts(raw_doc, shard, chunk_text_fn) if is_chunk_shard(shard)
-                      else slice_turns(raw_doc, shard))
+            if is_chunk_shard(shard):
+                turn_index = shard["start"]
+                if turn_index not in chunks_by_turn:
+                    chunks_by_turn[turn_index] = chunk_text_fn(raw_doc["turns"][turn_index]["text"])
+                payload = chunks_by_turn[turn_index][shard["chunk_start"]:shard["chunk_end"]]
+            else:
+                payload = slice_turns(raw_doc, shard)
             self.s3.put_object(
                 Bucket=self.bucket,
                 Key=self._slice_key(tenant_id, conversation_id, shard["index"]),

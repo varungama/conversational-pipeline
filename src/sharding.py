@@ -56,9 +56,10 @@ def _pack(costs: list, cap: int) -> list:
     """Fewest contiguous ranges under `cap` (via `_greedy_ranges`), then the cap is
     lowered as far as that count allows, so ranges come out near-equal instead of
     full-full-...-sliver. Shared by whole-turn and chunk-level packing."""
-    count = len(_greedy_ranges(costs, cap))
+    ranges = _greedy_ranges(costs, cap)
+    count = len(ranges)
     if count == 1:
-        return _greedy_ranges(costs, cap)
+        return ranges
     lo, hi = min(max(costs), cap), cap  # smallest cap that still yields `count` ranges
     while lo < hi:
         mid = (lo + hi) // 2
@@ -117,13 +118,32 @@ def is_chunk_shard(shard: dict) -> bool:
     return "chunk_start" in shard
 
 
+def plan_shards_and_cost(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=None, chunk_text_fn=None):
+    """(shards, total_cost) in one pass over the doc's turns - shards is `[]` for the common
+    case (the doc fits `max_cost` whole). Equivalent to calling `plan_shards` then
+    `estimate_cost` on the same doc, but tokenizes each turn once instead of twice for that
+    common case; callers that need both (run.py, the benchmark scripts) should use this."""
+    tenant_id, conversation_id = extract_identity(raw_doc)
+    turns = raw_doc.get("turns") if isinstance(raw_doc, dict) else None
+    if not tenant_id or not conversation_id or not isinstance(turns, list):
+        return [], estimate_cost(raw_doc, count_tokens)
+    total = max(1, sum(turn_cost(t, count_tokens) for t in turns))
+    if total <= max_cost:
+        return [], total
+    return plan_shards(raw_doc, max_cost=max_cost, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn), total
+
+
 def lpt_interleaved(tasks: list, lanes: int) -> list:
     """Longest-first order, dealt round-robin into `lanes` buckets and
     concatenated, so any `lanes`-sized window mixes big and small costs -
     safe to enqueue before a receive batch > 1 (one ReceiveMessage call can
     otherwise return several of the biggest tasks to a single worker).
     `tasks`: anything sortable by `tasks[i][0]` (cost first). `lanes <= 1`
-    is plain longest-first, unchanged from before this existed."""
+    is plain longest-first, unchanged from before this existed. Assumes delivery
+    order roughly tracks enqueue order - true on a single-process queue
+    (LocalStack, the only target this has been measured against), but SQS
+    standard queues only promise best-effort ordering, more so at real
+    multi-partition scale."""
     ordered = sorted(tasks, key=lambda t: -t[0])
     if lanes <= 1:
         return ordered
