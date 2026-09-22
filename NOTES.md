@@ -339,12 +339,9 @@ Simplified: shows the unsharded path. A large conversation (§6.1) adds one hop 
 
 1. Continuous poll loop instead of the current bounded drain-and-exit.
 2. CloudWatch alarm on DLQ depth, wired to page someone.
-3. ~~Standalone "volatility" metric~~ — done, §3.
-4. Re-run cost/benchmark scripts on the production CPU type.
-5. ONNX Runtime + INT8 quantisation — est. 2-4x, unmeasured.
-6. A human-labelled, real support-transcript set, for an accuracy number.
-7. Sarcasm / double-negation handling — still broken on both models tried.
-8. Retries with backoff on the local backend (AWS already gets this from SQS).
-9. Measure chunking's throughput cost on real, genuinely long transcripts.
-10. ~~S3 lifecycle expiry on slices/shards~~ — done, §6.1.4. ~~Chunk-level shards~~ — done, §6.1.1.
-11. ~~Plan-scoped shard/slice keys~~ — done, §6.1.4.
+3. Re-run cost/benchmark scripts on the production CPU type.
+4. ONNX Runtime + INT8 quantisation — est. 2-4x, unmeasured.
+5. A human-labelled, real support-transcript set, for an accuracy number.
+6. Sarcasm / double-negation handling — still broken on both models tried.
+7. Retries with backoff on the local backend (AWS already gets this from SQS).
+8. Measure chunking's throughput cost on real, genuinely long transcripts.
