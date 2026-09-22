@@ -199,7 +199,7 @@ Measured on one CPU core, single-conversation-set benchmark.
 1. Worker fleet size — solved by autoscaling.
 2. The idempotency ledger. It rewrites the whole seen-set on every write. `O(n)`. This is the real bottleneck, before fleet size is.
 
-**Scaling levers, by effort:** more workers (done) → length-sorted batching + sharding (built, §6.1; batching measured 1.1-1.2x on CPU) → ONNX + INT8 quantization (estimated 2–4x, not measured).
+**Scaling levers, by effort:** more workers (done) → length-sorted batching + sharding (built, §6.1; batching measured 1.1-1.2x on CPU) → ONNX + INT8 quantisation (estimated 2–4x, not measured).
 
 **Cost, as \$/month and \$/backfill (assumptions stated, not measured):**
 
@@ -234,7 +234,7 @@ Cost per conversation varies ~200x (c-000028 has 200 turns; the median is 5). CP
 
 | Step | What it does | Where |
 | --- | --- | --- |
-| Cost estimate | ms ≈ 8 per turn + 4 per token (model tokenizer); fallback 12 per turn + 1 per char. Fit R²: turns only 0.849, +chars 0.983, **+tokens 0.988** (82 points). | `sharding.py`, `scripts/fit_cost_model.py` |
+| Cost estimate | ms ≈ 8 per turn + 4 per token (model tokeniser); fallback 12 per turn + 1 per char. Fit R²: turns only 0.849, +chars 0.983, **+tokens 0.988** (82 points). | `sharding.py`, `scripts/fit_cost_model.py` |
 | Shard plan | Cost over `SHARD_MAX_COST=2500` (~2.5s): fewest shards under a **hard cap**, rebalanced to near-equal. A single turn over the cap is split into chunk-level shards at the model's own chunk boundaries (§6.1.1), so nothing exceeds the cap. | `sharding.plan_shards` |
 | Slices | Each shard's turns (or, for a chunk-level shard, that turn's own chunk texts) are written once to S3 `slices/`; a shard worker reads only its slice (500 shards: ~1.1 GB of reads becomes ~2.3 MB). | `S3ShardStore` |
 | Longest-first, interleaved | Sorted by descending cost, then dealt round-robin into `receive_batch_size` lanes, so one `ReceiveMessage` batch can't grab several of the biggest tasks. | `sharding.lpt_interleaved` |
@@ -260,7 +260,7 @@ Env overrides: `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTI
 | **2500** | 30 | 2.21s | +6% | 5.4s | 2.8s |
 | 5000 | 26 | 3.95s | +3% | 5.3s | 4.0s |
 
-**Shard plan on the shipped data** (cap 2500; costs in ~ms, from the model tokenizer):
+**Shard plan on the shipped data** (cap 2500; costs in ~ms, from the model tokeniser):
 
 | Conversation | Shard | Turns | Chunks | Cost |
 | --- | --- | --- | --- | --- |
@@ -363,7 +363,7 @@ sorted vs 6.21s interleaved. `lanes=1` reproduces the exact old sort.
 **Limits**
 - One machine, 25 conversations, one big one: re-run `scripts/fit_cost_model.py` and `scripts/benchmark.py` on the production CPU type.
 - Chunk-level sharding (§6.1.1) still leaves one chunk (≤2,048 cost) as the smallest unsplittable unit; a single sentence too large even for one chunk is hard-split by characters (§4.1) but that path was not exercised by real data here.
-- If the tokenizer loads but the full model then falls back to VADER (mismatched availability), a planned chunk-level shard would reach a non-transformer worker and raise clearly rather than silently mis-score - not exercised against a real such failure.
+- If the tokeniser loads but the full model then falls back to VADER (mismatched availability), a planned chunk-level shard would reach a non-transformer worker and raise clearly rather than silently mis-score - not exercised against a real such failure.
 - A dead-lettered shard reaches the DLQ; that conversation gets no result.
 - `slices/` and `shards/` are never deleted: add an S3 lifecycle expiry on both.
 - The local backend has batched scoring only: no sharding or cost ordering.
