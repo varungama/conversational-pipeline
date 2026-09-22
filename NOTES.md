@@ -287,89 +287,74 @@ Simulated makespan from those task times:
 
 #### 6.1.1 Chunk-level sharding: a turn bigger than the cap on its own
 
-Before this, a single turn costlier than `SHARD_MAX_COST` couldn't be split - it shipped as one
-oversized shard (c-000027 turn 0: cost 3,424 against a 2,500 cap, the whole reason the visibility
-timeout needed the `keep_alive` heartbeat rather than a fixed number). The scorer already had to cut
-that same turn into ≤510-token chunks to fit the model's window (`sentiment_model.chunk_text`,
-§4.1); this reuses exactly that chunker to shard at chunk granularity instead of turn granularity, so
-the same worst-case turn now costs at most one chunk's worth of work per shard (2,048 max, well under
-the 3,424 it used to be).
+A turn costlier than `SHARD_MAX_COST` used to ship as one oversized, unsplittable shard. The scorer
+already cuts long turns into ≤510-token chunks to fit the model's window (`sentiment_model.chunk_text`,
+§4.1); this reuses that same chunker to shard by chunk instead of by turn, so the worst case now costs
+one chunk (≤2,048), not one whole oversized turn.
 
-**Contract change:** a shard descriptor optionally carries `chunk_start`/`chunk_end` - indices into
-that one turn's own chunk list (`is_chunk_shard(shard)`). Its S3 slice holds that turn's chunk texts,
-not the raw turn. Its worker payload is a partial that is **not** a finished score -
-`{turn index: {"_chunk_probs": [[class_probs, token_count], ...]}}` - because a chunk's probabilities
-can't be finalised (label/score/confidence) until every chunk-shard of that turn has landed.
-`merge_partials` pools the `_chunk_probs` lists across shards once the conversation's shard count is
-complete, and finalises each turn with the same formula the un-sharded scorer uses
-(`sentiment_model.finalize_chunk_probs`, factored out so the two paths cannot diverge) - a whole-turn
-shard's already-finished score passes through merge unchanged, so both kinds coexist in one plan.
+| Contract change | Detail |
+| --- | --- |
+| Shard descriptor | Optional `chunk_start`/`chunk_end` (`is_chunk_shard`) - chunk indices within one turn, not turn indices |
+| S3 slice | That turn's chunk texts, not the raw turn |
+| Worker partial | Not a finished score - `{turn: {"_chunk_probs": [[class_probs, token_count], ...]}}`, pooled and finalised once every chunk-shard of that turn has landed, same formula as unsharded scoring (`merge_partials`, `sentiment_model.finalize_chunk_probs`) |
+| Backend | Transformer only (`_class_probs_batch`); VADER has no window limit, never needs this |
 
-**Verified equal to unsharded, real model, real shipped data (c-000027):** scoring turn 0 whole gives
-`{"label": "negative", "score": -0.9968, "confidence": 0.9983, "n_chunks": 2}`; scoring it as 2
-chunk-shards and merging gives the exact same dict, and the exact same final record end to end
-(`evaluate()` with the merged scores equals `evaluate()` unsharded, byte for byte). Confirmed again
-through a real `run.py --backend aws` run against LocalStack - c-000027's stored result matches.
-Moto test: `test_oversized_turn_is_chunk_sharded_and_merges_to_the_unsharded_result`. Real-model check:
-`scripts/fit_cost_model.py`-adjacent ad hoc script, not shipped.
-
-**Transformer-only.** `score_chunk_shard` needs `scorer._class_probs_batch`, which the VADER fallback
-doesn't have (VADER has no window limit, so it never needs this). `plan_shards` is only given a
-`chunk_text_fn` when a tokenizer loaded, which is a reasonable proxy but not a guarantee the scorer
-itself will end up on the transformer backend (see NOTES.md limits below).
+**Verified:** scoring c-000027 turn 0 whole and as 2 chunk-shards give the identical dict
+(`{"label": "negative", "score": -0.9968, "confidence": 0.9983, "n_chunks": 2}`), and the full record
+matches `evaluate()` unsharded byte for byte - confirmed on the real model and again via a real
+`run.py --backend aws` run against LocalStack. Test: `test_oversized_turn_is_chunk_sharded_...`.
 
 #### 6.1.2 Shard-merge race, fixed
 
-**Finding:** two shards can finish "simultaneously" - both see `len(shard_store.indexes(...)) ==
-count`, both call `merge_partials` + `evaluate()`, both attempt `try_claim`. Correct (`try_claim` lets
-only one actually persist the result; the loser acks as `skipped_duplicate`) but wasteful: the loser
-did a full S3 `GET` of the raw document and built the whole output record for nothing. The root cause
-is that the old check was list-then-compare - two shards can both list the same completed set before
-either has "claimed" anything, a read-then-decide gap.
+**Finding:** two shards landing together could both see `len(shard_store.indexes(...)) == count`,
+both merge, both attempt `try_claim`. Correct (`try_claim` lets only one persist the result; the
+loser acks as `skipped_duplicate`) but wasteful: the loser did a full S3 `GET` and built the whole
+output record for nothing - list-then-compare has a read-then-decide gap.
 
-**Fix:** replaced the S3 listing check with `DynamoResultIndex.mark_shard_landed(key, shard_index,
-total)` - one atomic DynamoDB `UpdateItem` (`ADD` to a set) per shard landing, in a separate item
-(`"shards::" + key`) from the result claim so it can never collide with `try_claim`. DynamoDB
-serialises concurrent updates to the same item, so **exactly one** caller's update is ever the one
-that brings the set to `total` size - no two shards can both see completion, by construction, not by
-a retry-after-the-fact claim. Only that one shard proceeds to `merge_partials`/`evaluate`; every other
-shard's cost is one small atomic write, not a full document fetch and record build.
+**Fix:** `DynamoResultIndex.mark_shard_landed(key, shard_index, total)` - one atomic DynamoDB `ADD`
+to a set, in its own item (`"shards::" + key`, never collides with `try_claim`). DynamoDB serialises
+concurrent updates to one item, so exactly one caller's update ever completes the set - no two shards
+can see completion, by construction, not by a retry-after-the-fact claim.
 
-**Why not a lock instead:** a naive fix would be a mutex ("first shard to see completion claims an
-exclusive lock, does the merge"). Rejected - if the lock-holder crashes mid-merge, the lock is stuck
-forever with no lease/expiry, and the conversation would never complete. `mark_shard_landed` isn't a
-lock: it's a monotonic, idempotent-per-shard-index counter. If the winning shard crashes before
-finishing, its SQS message was never acked, so SQS redelivers it; the redelivered call adds the same
-already-present index (a no-op) and still returns True (nothing is ever removed from the set), so the
-merge is retried by SQS's own redelivery - the same self-healing mechanism the rest of this pipeline
-already relies on, not a new one.
+**Not a lock:** a naive mutex ("first to see completion claims an exclusive lock") would leak if the
+lock-holder crashed mid-merge - stuck forever, conversation never completes. `mark_shard_landed` is a
+monotonic, idempotent-per-shard counter instead: if the winner crashes, its un-acked SQS message gets
+redelivered, the redelivered `ADD` is a no-op and still returns True, so the merge is retried by SQS's
+own redelivery - the same self-healing mechanism the rest of the pipeline already relies on.
 
-**Verified:**
-- Moto: `test_mark_shard_landed_is_true_only_once_the_set_is_complete`,
-  `test_mark_shard_landed_is_idempotent_under_redelivery`,
-  `test_mark_shard_landed_has_exactly_one_winner_under_real_concurrency` (8 threads landing at once,
-  exactly 1 `True`), `test_shards_that_finish_simultaneously_still_merge_exactly_once` (3 separate
-  `AwsWorker` instances, 3 threads, processing 3 real shard messages concurrently through the full
-  `_handle` path - exactly one `processed`, result equals `evaluate()` unsharded).
-- Real LocalStack, not moto: same three properties (sequential correctness, idempotent redelivery,
-  exactly 1 winner of 10 threads racing) reproduced against real DynamoDB semantics, ad hoc script.
-- Real 4-*process* concurrency (not threads): `scripts/bench_workers.py --workers 4`, sharded mode,
-  2 repeats - `results: 25` both times (25 conversations in, 25 merged records out, every time).
-- `ReturnValues="ALL_NEW"`, not `"UPDATED_NEW"` - a redelivered shard's `ADD` is a no-op, and
-  DynamoDB-local/moto then omits the attribute from `UPDATED_NEW` entirely rather than reporting it
-  unchanged; found by the idempotent-redelivery test failing, not by inspection.
-- `S3ShardStore.indexes()` removed - dead code once the completion check no longer lists S3.
+| Verified | Result |
+| --- | --- |
+| Moto | Sequential correctness; idempotent redelivery; 8 threads racing → exactly 1 winner; 3 concurrent `AwsWorker`s merging one real conversation → exactly 1 `processed`, result equals `evaluate()` unsharded |
+| Real LocalStack (not moto) | Same three properties reproduced against real DynamoDB |
+| Real 4-*process* concurrency | `bench_workers.py --workers 4`, sharded, 2 repeats: `results: 25` both times |
+| Bug caught along the way | `ReturnValues="ALL_NEW"`, not `"UPDATED_NEW"` - a no-op `ADD` (redelivery) omits the attribute under `UPDATED_NEW` entirely; found by a failing test, not inspection |
 
-**Real 4-worker run on LocalStack, with `lpt_interleaved`** (3 torch threads each, 25 conversations):
+`S3ShardStore.indexes()` removed - dead code once the completion check no longer lists S3.
 
-| Receive batch | Unsharded | Longest-first | Sharded + longest-first | Worker finish times (sharded) |
-| --- | --- | --- | --- | --- |
-| 1 | 22.1s | 17.4s (1.27x) | **16.4s (1.35x)** | [16.2, 16.3, 16.3, 16.4] |
-| 5 | 20.7s | 19.9s (1.04x) | 17.7s (1.17x) | [11.6, 15.2, 15.7, 17.7] |
+#### 6.1.3 Receive-batch dispatch: interleaving
 
-Before `lpt_interleaved` (plain longest-first sort, same machine, an earlier run): batch 1 gave 15.8s (1.51x), batch 5 regressed to 26.0s (0.84x) — one worker grabbed the 5 biggest tasks. Interleaving fixes most of that: batch 5's sharded makespan is now 1.08x batch 1's, not 1.65x. It is not perfect — worker finish times at batch 5 still spread over 6s (11.6 to 17.7), against 0.2s at batch 1 — because interleaving trades "biggest task starts absolute first" for "no window is all-big," not for perfect balance. `RECEIVE_BATCH_SIZE` stays 1 by default regardless; this is what makes raising it safe if the SQS request-count saving is ever wanted.
+**Why batch 5 regressed:** one `ReceiveMessage` call returns up to `receive_batch_size` messages to
+whichever worker calls it - SQS does not round-robin within a call. Sorted strictly biggest-first,
+the front of the queue *is* the 5 biggest tasks, so the first poller gets all 5.
 
-**Why batch 5 regressed, and the fix:** one `ReceiveMessage` call returns up to `receive_batch_size` messages to whichever worker calls it - SQS does not round-robin within a call. Sorted strictly biggest-first, the front of the queue *is* the 5 biggest tasks, so the first poller gets all 5. `lpt_interleaved` deals the sorted list round-robin into `receive_batch_size` lanes before enqueueing, so no batch-sized window is all-big; the single biggest task still goes out first, the trade-off is that the 2nd-5th biggest start a little later. Matches a synthetic check (26 small + 6 near-cap tasks, `scripts/benchmark.py`'s `simulate`, 4 workers): batch 5 makespan 9.88s sorted vs 6.21s interleaved. `lanes=1` reproduces the exact old sort.
+**Fix:** `lpt_interleaved` deals the sorted list round-robin into `receive_batch_size` lanes before
+enqueueing, so no batch-sized window is all-big. Trade-off: the single biggest task still goes out
+first, but the 2nd-5th biggest now start a little later than under plain sorting.
+
+**Real 4-worker run on LocalStack** (3 torch threads each, 25 conversations), before vs after the fix:
+
+| Receive batch | Unsharded | Longest-first | Sharded + longest-first |
+| --- | --- | --- | --- |
+| 1 | 22.1s | 17.4s (1.27x) | **16.4s (1.35x)** |
+| 5, before the fix | 22.0s | 28.2s (0.78x) | 26.0s (0.84x) |
+| 5, after the fix | 20.7s | 19.9s (1.04x) | 17.7s (1.17x) |
+
+Batch 5's sharded makespan went from 1.65x worse than batch 1's to 1.08x - not perfect (worker
+finish times still spread ~6s at batch 5, against 0.2s at batch 1), because interleaving trades
+"biggest task starts absolute first" for "no window is all-big," not for perfect balance.
+`RECEIVE_BATCH_SIZE` stays 1 by default; this is what makes raising it safe if the request-count
+saving is ever wanted. Synthetic check (`scripts/benchmark.py`'s `simulate`): batch 5 makespan 9.88s
+sorted vs 6.21s interleaved. `lanes=1` reproduces the exact old sort.
 
 **Scores are not bit-identical to per-turn or unsharded scoring.** Batch composition changes padding: 73/319 turn scores differ from the pre-batching run (max 0.004), sharded c-000028 differs from unsharded by up to ~0.002. No labels changed. Deterministic for a fixed input and shard plan.
 
