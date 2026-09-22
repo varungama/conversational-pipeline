@@ -34,7 +34,7 @@ python run.py --input data/conversations --output results
 
 - Python 3.11–3.14. ~650MB disk (model + deps).
 - First run downloads the model (~550MB). Later runs are offline.
-- ~9s model load. ~20s to score 27 sample conversations.
+- ~9s model load. ~20s to score 28 sample conversations.
 - Writes only to `queue/` and `results/`. No account or API key needed.
 
 AWS backend (needs Docker):
@@ -396,7 +396,8 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 | `queue/processing` (rename) | SQS visibility timeout |
 | `queue/dead_letter` + reason | SQS redrive policy → DLQ |
 | `results/*.json` | S3 |
-| `results/index.json` | DynamoDB, conditional write |
+| `results/index.json` | DynamoDB, conditional write (also tracks shard completion atomically for sharded conversations - §6.1.2) |
+| — (sharding is AWS-only, no local equivalent) | S3 `slices/`/`shards/` for a large conversation's pieces - §6.1, §6.1.1 |
 
 ```text
                     ┌───────────────────────┐
@@ -437,6 +438,11 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
       └────────────────────────┘
 ```
 
+Simplified: shows the unsharded path. A large conversation (§6.1) adds one more hop between SQS
+and the DynamoDB/S3 boxes above - a worker fetches its shard's slice instead of the whole
+document, parks a partial, and `mark_shard_landed` (a second, atomic use of the same DynamoDB
+table, §6.1.2) decides which one shard merges and reaches `try_claim`.
+
 - **Worker:** ECS Fargate. Not Lambda — the model needs to stay loaded, not reload per invocation.
 - **Why SQS over Kafka:** one consumer group, one job per message. No need for independent fan-out or full-stream replay. SQS is zero-ops here; Kafka would just be an always-on cost.
 - **Scaling:** ECS autoscaling on SQS queue depth. Hard max task count, so a bad backfill re-queue can't run up an unbounded bill.
@@ -446,7 +452,8 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
   - Then verified against a real LocalStack container: `25 processed, 1 skipped_duplicate, 2 dead_lettered`.
   - Re-run on the same warm container: `processed: 0, skipped_duplicate: 26` — proves the ledger survives across separate processes.
   - **Real bug found:** default `--aws-drain-timeout` (30s) was too short to let SQS redrive stuck messages. Bumped to 60s. Re-run confirmed the fix.
-  - Not verified: LocalStack's fidelity to real AWS in rarer corners (IAM, edge-case API behaviour).
+  - Since then: sharding, chunk-level sharding, interleaved dispatch and the shard-merge race fix (§6.1-6.1.3) were each re-verified the same way — moto, then real LocalStack, then (for the merge race) real 4-process concurrency. Current counts: 33 tasks, 25 processed, 5 shard partials merged.
+  - Not verified: LocalStack's fidelity to real AWS in rarer corners (IAM, edge-case API behaviour, real multi-partition SQS ordering — §6.1.3's caveat on `lpt_interleaved`).
 - **Is AWS the right call?** Mostly yes. The 500M backfill is what justifies it — steady state (2M/day) alone would fit on a scheduled container.
 
 ---
@@ -462,4 +469,5 @@ Local → AWS mapping (now actually implemented in `src/aws/`, not just designed
 7. Sarcasm / double-negation handling — still broken on both models tried so far.
 8. Retries with backoff on the local backend (AWS backend already gets this from SQS).
 9. Measure chunking's throughput cost on a set of genuinely long, real transcripts (behaviour is verified, §4.1; cost is not).
-10. S3 lifecycle expiry on `slices/` and `shards/` (never deleted otherwise).
+10. S3 lifecycle expiry on `slices/` and `shards/` (never deleted otherwise). ~~Chunk-level shards for very large single turns~~ — done, §6.1.1.
+11. Shard/slice state isn't scoped to a plan version - keyed only by `tenant::conversation`, never by which shard plan produced it. Since nothing deletes old `slices/`/`shards/` and a plan isn't guaranteed stable across reruns (a different `--model` or `SHARD_MAX_COST`), a rerun with a changed plan could in principle merge stale leftover shard data alongside current. Not hit in practice (found by review, not by a failure); the fix is to fold a plan/content hash into the S3 and DynamoDB keys (`input_sha256` already exists for this purpose - src/scoring.py).
