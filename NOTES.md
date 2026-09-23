@@ -45,7 +45,7 @@ Flags (all recorded in each output's `model` block):
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--model {roberta,distilbert}` | roberta | |
-| `--workers N` | 1 | local or aws (§6.1.5); on aws also sizes the receive-batch/interleave lanes |
+| `--workers N` | 1 | local or aws (§6.1.2); on aws also sizes the receive-batch/interleave lanes |
 | `--weighting {equal,confidence}` | confidence | |
 | `--backend {local,aws}` | local | |
 | `--scored-at <ISO8601>` | fixed | byte-identical reruns |
@@ -188,7 +188,7 @@ Cost per conversation varies ~200x (c-000028: 200 turns; median 5). CPU only, no
 | Dispatch | Longest-first, interleaved into `receive_batch_size` lanes | `lpt_interleaved` |
 | Batching | ≤32 items, ≤512 padded tokens per `score_batch` call | `SentimentScorer` |
 | Merge | `mark_shard_landed` (atomic) picks the one merging shard | `aws/worker.py` |
-| Receive batch | `RECEIVE_BATCH_SIZE=1`; `--workers N` auto-matches it (§6.1.5) | `aws/config.py` |
+| Receive batch | `RECEIVE_BATCH_SIZE=1`; `--workers N` auto-matches it (§6.1.2) | `aws/config.py` |
 | Heartbeat | `keep_alive` re-extends visibility every 1/3 timeout | `SqsQueue` |
 
 Env overrides: `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTIMENT_WORST_TASK_SECONDS`.
@@ -230,7 +230,7 @@ An oversized turn used to ship as one unsplittable shard. Now reuses the scorer'
 
 Verified: chunked vs whole scoring gives an identical dict; matches `evaluate()` byte-for-byte on the real model and via a real LocalStack run.
 
-#### 6.1.5 Multi-process AWS workers
+#### 6.1.2 Multi-process AWS workers
 
 `--workers N` now spans the aws backend too: `run.py` spawns N processes against the same SQS queue, each loading its own model (mirrors `bench_workers.py`'s design; nothing survives a process spawn).
 
@@ -240,9 +240,7 @@ Verified: chunked vs whole scoring gives an identical dict; matches `evaluate()`
 
 **Verified:** `--backend aws --model roberta --workers 3 --aws-drain-timeout 90` on the full set, fresh LocalStack: both bugs reproduced pre-fix (a message vanished; spurious duplicates), then 25 processed + 1 duplicate + 2 dead-lettered = 28 and an empty queue/DLQ post-fix.
 
-#### 6.1.6 Worker-count cost variation
-
-Real run, `bench_workers.py --workers {1,2,4,8}` on LocalStack: cost isn't linear in workers — 2 workers cost more than 1 (simultaneous model loads starve RAM on this 16GB box) — and only interleaved dispatch + sharding turn extra workers into savings, $245/M unsharded vs $67/M sharded at 8 workers.
+**Fix:** idle-exit poll interval is now a flat 3.5s instead of scaling with `visibility_timeout` (which grows with `--workers`), so wall-clock no longer inflates as workers increase.
 
 ---
 

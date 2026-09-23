@@ -19,6 +19,10 @@ from src.worker import Worker
 
 logger = logging.getLogger(__name__)
 
+IDLE_POLL_INTERVAL_SECONDS = 3.5  # how often an idle worker rechecks queue depth before exiting; independent of
+# visibility_timeout_seconds so the idle-exit tail doesn't grow with --workers (which sizes receive_batch_size,
+# which sizes visibility_timeout for redelivery-safety reasons unrelated to how often we should poll)
+
 
 def _write_run_output(output_dir: pathlib.Path, combined: list, dead_letters: list, summary: dict):
     """Shared tail of both backends: write results.json/errors.json and log the run summary."""
@@ -102,7 +106,7 @@ def _drain_queue(worker, queue, config, drain_timeout: float) -> dict:
             idle_passes += 1
             if idle_passes >= 3 and queue.approximate_depth() == 0:
                 break
-            time.sleep(config.visibility_timeout_seconds / 2 + 0.5)
+            time.sleep(IDLE_POLL_INTERVAL_SECONDS)
         else:
             idle_passes = 0
     return summary
