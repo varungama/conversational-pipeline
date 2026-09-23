@@ -15,6 +15,7 @@ from src.metrics import DEFAULT_WEIGHTING, WEIGHTING_CHOICES
 from src.queue_store import FileQueue
 from src.sentiment_model import DEFAULT_MODEL_KEY, MODEL_REGISTRY, SentimentScorer, chunk_text, load_token_counter
 from src.sharding import lpt_interleaved, plan_shards_and_cost
+from src.timing import StageTimer
 from src.worker import Worker
 
 logger = logging.getLogger(__name__)
@@ -76,15 +77,19 @@ def _run_one_worker_process(worker_index, total_workers, work_dir_str, output_di
     configure_logging(pathlib.Path(log_dir_str), suffix=f"_worker{worker_index}")
     try:
         _limit_torch_threads(total_workers)
+        timer = StageTimer()
         queue = FileQueue(pathlib.Path(work_dir_str))
         logger.info("[worker %d] Loading sentiment model %s...", worker_index, model_key)
-        scorer = SentimentScorer(model_key=model_key)
+        with timer.time("model_load"):
+            scorer = SentimentScorer(model_key=model_key)
         logger.info("[worker %d] Using scoring backend: %s (%s @ %s)", worker_index,
                     scorer.backend_name, scorer.model_name, scorer.model_revision)
-        worker = Worker(queue, pathlib.Path(output_dir_str), scorer, scored_at=scored_at, weighting=weighting)
+        worker = Worker(queue, pathlib.Path(output_dir_str), scorer, scored_at=scored_at, weighting=weighting,
+                         timer=timer)
         summary = worker.run_once()
         logger.info("[worker %d] Done: %s", worker_index, json.dumps(summary))
-        result_conn.send(summary)
+        timer.log_summary(logger)
+        result_conn.send({"summary": summary, "timing": timer.snapshot()})
     finally:
         result_conn.close()
 
@@ -125,6 +130,7 @@ def _run_one_aws_worker_process(worker_index, total_workers, config, infra, drai
     configure_logging(pathlib.Path(log_dir_str), suffix=f"_worker{worker_index}")
     try:
         _limit_torch_threads(total_workers)
+        timer = StageTimer()
         clients = AwsClients(config)
         queue = SqsQueue(clients, infra["queue_url"], infra["dlq_url"], config.visibility_timeout_seconds)
         conversations = S3ConversationStore(clients, config.conversations_bucket)
@@ -133,20 +139,22 @@ def _run_one_aws_worker_process(worker_index, total_workers, config, infra, drai
         shard_store = S3ShardStore(clients, config.conversations_bucket)
 
         logger.info("[worker %d] Loading sentiment model %s...", worker_index, model_key)
-        scorer = SentimentScorer(model_key=model_key)
+        with timer.time("model_load"):
+            scorer = SentimentScorer(model_key=model_key)
         logger.info("[worker %d] Using scoring backend: %s (%s @ %s)", worker_index,
                     scorer.backend_name, scorer.model_name, scorer.model_revision)
 
         worker = AwsWorker(queue, conversations, results_store, ledger, scorer,
-                            scored_at=scored_at, weighting=weighting, shard_store=shard_store)
+                            scored_at=scored_at, weighting=weighting, shard_store=shard_store, timer=timer)
         summary = _drain_queue(worker, queue, config, drain_timeout)
         logger.info("[worker %d] Done: %s", worker_index, json.dumps(summary))
-        result_conn.send(summary)
+        timer.log_summary(logger)
+        result_conn.send({"summary": summary, "timing": timer.snapshot()})
     finally:
         result_conn.close()
 
 
-def run_local(args):
+def run_local(args, timer: StageTimer):
     input_dir = pathlib.Path(args.input)
     work_dir = pathlib.Path(args.work_dir)
     output_dir = pathlib.Path(args.output)
@@ -154,19 +162,21 @@ def run_local(args):
 
     queue = FileQueue(work_dir)
     enqueued = 0
-    for source_file in sorted(input_dir.glob("*.json")):
-        queue.enqueue(source_file)
-        enqueued += 1
+    with timer.time("enqueue"):
+        for source_file in sorted(input_dir.glob("*.json")):
+            queue.enqueue(source_file)
+            enqueued += 1
     logger.info("Enqueued %d conversation file(s) from %s", enqueued, input_dir)
 
     if args.workers <= 1:
         logger.info("Loading sentiment model %s (downloads on first run if not already cached)...",
                      args.model)
-        scorer = SentimentScorer(model_key=args.model)
+        with timer.time("model_load"):
+            scorer = SentimentScorer(model_key=args.model)
         logger.info("Using scoring backend: %s (%s @ %s)",
                     scorer.backend_name, scorer.model_name, scorer.model_revision)
 
-        worker = Worker(queue, output_dir, scorer, scored_at=args.scored_at, weighting=args.weighting)
+        worker = Worker(queue, output_dir, scorer, scored_at=args.scored_at, weighting=args.weighting, timer=timer)
         summary = worker.run_once()
     else:
         logger.info("Starting %d worker processes against %s (model=%s, weighting=%s)",
@@ -187,11 +197,12 @@ def run_local(args):
 
         summary = {"processed": 0, "skipped_duplicate": 0, "dead_lettered": 0}
         for worker_index, (process, conn) in enumerate(zip(processes, parent_conns)):
-            worker_summary = conn.recv()
+            result = conn.recv()
             conn.close()
             process.join()
-            for key, count in worker_summary.items():
+            for key, count in result["summary"].items():
                 summary[key] = summary.get(key, 0) + count
+            timer.merge(result["timing"])
             log = logger.info if process.exitcode == 0 else logger.warning
             log("worker %d exited with code %s", worker_index, process.exitcode)
 
@@ -212,7 +223,7 @@ def run_local(args):
     _write_run_output(output_dir, combined, dead_letters, summary)
 
 
-def run_aws(args):
+def run_aws(args, timer: StageTimer):
     from src.aws.bootstrap import ensure_infrastructure
     from src.aws.clients import AwsClients
     from src.aws.config import AwsConfig
@@ -260,19 +271,24 @@ def run_aws(args):
             # No identity for an S3 key: upload under a synthetic key so it dead-letters through normal validation.
             tenant_id, conversation_id = "unknown", source_file.stem
         expected_identities.add((tenant_id, conversation_id))
-        conversations.put(tenant_id, conversation_id, raw_doc)
-        shards, cost = plan_shards_and_cost(raw_doc, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
+        with timer.time("conversation_upload"):
+            conversations.put(tenant_id, conversation_id, raw_doc)
+        with timer.time("sharding_plan"):
+            shards, cost = plan_shards_and_cost(raw_doc, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
         if shards:
-            shard_store.put_slices(tenant_id, conversation_id, raw_doc, shards, chunk_text_fn)  # before enqueueing
+            with timer.time("shard_slice_upload"):
+                shard_store.put_slices(tenant_id, conversation_id, raw_doc, shards, chunk_text_fn)  # before enqueueing
             tasks.extend((shard["cost"], tenant_id, conversation_id, shard) for shard in shards)
         else:
             tasks.append((cost, tenant_id, conversation_id, None))
         enqueued += 1
 
     # Longest-first, interleaved by receive batch size so one ReceiveMessage can't grab several big tasks at once.
-    tasks = lpt_interleaved(tasks, config.receive_batch_size)
-    for _, tenant_id, conversation_id, shard in tasks:
-        queue.enqueue(tenant_id, conversation_id, shard=shard)
+    with timer.time("lane_packing"):
+        tasks = lpt_interleaved(tasks, config.receive_batch_size)
+    with timer.time("sqs_enqueue"):
+        for _, tenant_id, conversation_id, shard in tasks:
+            queue.enqueue(tenant_id, conversation_id, shard=shard)
     logger.info("Enqueued %d conversation file(s) from %s as %d task(s)", enqueued, input_dir, len(tasks))
 
     logger.info("Visibility timeout %ds for receive batches of %d (worst-case task %.0fs)",
@@ -280,12 +296,13 @@ def run_aws(args):
 
     if args.workers <= 1:
         logger.info("Loading sentiment model %s (downloads on first run if not already cached)...", args.model)
-        scorer = SentimentScorer(model_key=args.model)
+        with timer.time("model_load"):
+            scorer = SentimentScorer(model_key=args.model)
         logger.info("Using scoring backend: %s (%s @ %s)",
                     scorer.backend_name, scorer.model_name, scorer.model_revision)
 
         worker = AwsWorker(queue, conversations, results_store, ledger, scorer, scored_at=args.scored_at,
-                            weighting=args.weighting, shard_store=shard_store)
+                            weighting=args.weighting, shard_store=shard_store, timer=timer)
         summary = _drain_queue(worker, queue, config, args.aws_drain_timeout)
         dead_letter_worker = worker
     else:
@@ -307,11 +324,12 @@ def run_aws(args):
 
         summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0, "shards_scored": 0}
         for worker_index, (process, conn) in enumerate(zip(processes, parent_conns)):
-            worker_summary = conn.recv()
+            result = conn.recv()
             conn.close()
             process.join()
-            for key, count in worker_summary.items():
+            for key, count in result["summary"].items():
                 summary[key] = summary.get(key, 0) + count
+            timer.merge(result["timing"])
             log = logger.info if process.exitcode == 0 else logger.warning
             log("worker %d exited with code %s", worker_index, process.exitcode)
 
@@ -375,17 +393,19 @@ def main():
 
     run_start = datetime.now(timezone.utc)
     start_monotonic = time.monotonic()
+    timer = StageTimer()
 
     if args.backend == "aws":
-        run_aws(args)
+        run_aws(args, timer)
     else:
-        run_local(args)
+        run_local(args, timer)
 
     elapsed_seconds = time.monotonic() - start_monotonic
     run_end = datetime.now(timezone.utc)
     logger.info("Run started at %s, finished at %s, total wall-clock time: %.2fs (%dm %.1fs)",
                 run_start.isoformat(), run_end.isoformat(), elapsed_seconds,
                 int(elapsed_seconds // 60), elapsed_seconds % 60)
+    timer.log_summary(logger, total_elapsed=elapsed_seconds)
 
 
 if __name__ == "__main__":

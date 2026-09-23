@@ -11,9 +11,10 @@ logger = logging.getLogger(__name__)
 
 
 class Message:
-    def __init__(self, receipt_handle: str, body: dict):
+    def __init__(self, receipt_handle: str, body: dict, sent_timestamp: float | None = None):
         self.receipt_handle = receipt_handle
         self.body = body
+        self.sent_timestamp = sent_timestamp  # epoch seconds SQS accepted this message, for queue-wait timing
 
 
 class SqsQueue:
@@ -37,9 +38,15 @@ class SqsQueue:
             QueueUrl=self.queue_url,
             MaxNumberOfMessages=max_messages,
             WaitTimeSeconds=wait_time_seconds,
+            AttributeNames=["SentTimestamp"],
         )
         return [
-            Message(receipt_handle=m["ReceiptHandle"], body=json.loads(m["Body"]))
+            Message(
+                receipt_handle=m["ReceiptHandle"],
+                body=json.loads(m["Body"]),
+                sent_timestamp=int(m["Attributes"]["SentTimestamp"]) / 1000.0
+                if m.get("Attributes", {}).get("SentTimestamp") else None,
+            )
             for m in response.get("Messages", [])
         ]
 

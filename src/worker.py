@@ -10,13 +10,14 @@ from src.queue_store import FileQueue
 from src.result_index import ResultIndex
 from src.scoring import evaluate, result_key
 from src.sentiment_model import SentimentScorer
+from src.timing import StageTimer
 
 logger = logging.getLogger(__name__)
 
 
 class Worker:
     def __init__(self, queue: FileQueue, results_dir: pathlib.Path, scorer: SentimentScorer,
-                 scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING):
+                 scored_at: str | None = None, weighting: str = DEFAULT_WEIGHTING, timer: StageTimer | None = None):
         self.queue = queue
         self.results_dir = results_dir
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -24,6 +25,7 @@ class Worker:
         self.index = ResultIndex(results_dir / "index.json")
         self.scored_at = scored_at  # overrides `scored_at` for byte-identical reruns (src/scoring.py)
         self.weighting = weighting  # "equal" or "confidence" - see src/metrics.py
+        self.timer = timer or StageTimer()
 
     def run_once(self) -> dict:
         """Processes everything currently pending. Returns counts by outcome."""
@@ -37,8 +39,13 @@ class Worker:
         return summary
 
     def _process_one(self, path: pathlib.Path) -> str:
+        with self.timer.time("processing"):
+            return self._process_one_timed(path)
+
+    def _process_one_timed(self, path: pathlib.Path) -> str:
         try:
-            raw_doc = json.loads(path.read_text(encoding="utf-8"))
+            with self.timer.time("read_input"):
+                raw_doc = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             logger.error("Could not read %s as JSON: %s", path.name, exc)
             self.queue.mark_dead(path, f"unreadable_json: {exc}")
@@ -53,8 +60,9 @@ class Worker:
             return "skipped_duplicate"
 
         try:  # the model can throw on unforeseen input; dead-letter it instead of failing the batch
-            outcome = evaluate(raw_doc, self.scorer, source_ref=path.name, scored_at=self.scored_at,
-                                weighting=self.weighting)
+            with self.timer.time("scoring"):
+                outcome = evaluate(raw_doc, self.scorer, source_ref=path.name, scored_at=self.scored_at,
+                                    weighting=self.weighting)
         except Exception as exc:
             logger.exception("Unexpected error scoring %s", path.name)
             self.queue.mark_dead(path, f"scoring_failed: {exc}")
@@ -75,6 +83,7 @@ class Worker:
             self.queue.mark_done(path)
             return "skipped_duplicate"
 
-        out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        with self.timer.time("result_write"):
+            out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         self.queue.mark_done(path)
         return "processed"
