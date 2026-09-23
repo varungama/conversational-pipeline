@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+import logging
 
 from src import conversation as conv
 from src.scoring import extract_identity, input_content_hash, score_turns
 from src.sentiment_model import finalize_chunk_probs
+
+logger = logging.getLogger(__name__)
 
 COST_PER_TURN = 8    # ~ms fixed work per turn (fitted)
 COST_PER_TOKEN = 4   # ~ms per token (fitted)
@@ -62,7 +65,10 @@ def _pack(costs: list, cap: int) -> list:
             hi = mid
         else:
             lo = mid + 1
-    return _greedy_ranges(costs, hi)
+    balanced = _greedy_ranges(costs, hi)
+    logger.debug("_pack: %d item(s), cap=%d -> %d range(s) (balanced at cap=%d): %s",
+                 len(costs), cap, count, hi, balanced)
+    return balanced
 
 
 def plan_shards(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=None, chunk_text_fn=None) -> list[dict]:
@@ -101,6 +107,17 @@ def plan_shards(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=None, chun
     h = plan_hash(raw_doc, shards)
     for shard in shards:
         shard["plan_hash"] = h
+
+    logger.info("plan_shards %s/%s: %d turn(s), cost=%d > cap=%d -> %d shard(s) (plan_hash=%s)",
+                tenant_id, conversation_id, len(turns), sum(costs), max_cost, len(shards), h)
+    for shard in shards:
+        if is_chunk_shard(shard):
+            logger.debug("  shard %d/%d: turn %d, chunks %d-%d, cost=%d",
+                         shard["index"], shard["count"], shard["start"],
+                         shard["chunk_start"], shard["chunk_end"] - 1, shard["cost"])
+        else:
+            logger.debug("  shard %d/%d: turns %d-%d, cost=%d",
+                         shard["index"], shard["count"], shard["start"], shard["end"] - 1, shard["cost"])
     return shards
 
 
@@ -127,12 +144,25 @@ def plan_shards_and_cost(raw_doc, max_cost: int = SHARD_MAX_COST, count_tokens=N
     return plan_shards(raw_doc, max_cost=max_cost, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn), total
 
 
+def _task_label(task: tuple) -> str:
+    """Human-readable label for a (cost, tenant_id, conversation_id, shard) task; falls back to the raw tuple."""
+    if len(task) == 4:
+        cost, tenant_id, conversation_id, shard = task
+        suffix = f"#shard{shard['index']}" if shard else ""
+        return f"{tenant_id}/{conversation_id}{suffix} (cost={cost})"
+    return repr(task)
+
+
 def lpt_interleaved(tasks: list, lanes: int) -> list:
     """Longest-first, dealt round-robin into `lanes` buckets so no `lanes`-sized receive-batch window is all-big."""
     ordered = sorted(tasks, key=lambda t: -t[0])
+    lanes_of = [ordered] if lanes <= 1 else [ordered[i::lanes] for i in range(lanes)]
+    if logger.isEnabledFor(logging.DEBUG):
+        for i, lane in enumerate(lanes_of):
+            logger.debug("lane %d: %d task(s), total cost=%d: %s",
+                         i, len(lane), sum(t[0] for t in lane), [_task_label(t) for t in lane])
     if lanes <= 1:
         return ordered
-    lanes_of = [ordered[i::lanes] for i in range(lanes)]
     return [task for lane in lanes_of for task in lane]
 
 

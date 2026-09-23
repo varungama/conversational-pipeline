@@ -32,7 +32,7 @@ def _write_run_output(output_dir: pathlib.Path, combined: list, dead_letters: li
     logger.info("Wrote %d dead-lettered conversation(s) to %s", len(dead_letters), output_dir / "errors.json")
 
 
-def configure_logging(log_dir: pathlib.Path, suffix: str = "") -> pathlib.Path:
+def configure_logging(log_dir: pathlib.Path, suffix: str = "", level: int = logging.INFO) -> pathlib.Path:
     """Logs to the console and a timestamped file in log_dir; `suffix` keeps concurrent worker processes off one file."""
     log_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -47,7 +47,7 @@ def configure_logging(log_dir: pathlib.Path, suffix: str = "") -> pathlib.Path:
     file_handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(level)
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
@@ -245,6 +245,8 @@ def main():
                          help="[aws backend only] Max seconds to keep draining the queue before giving up.")
     parser.add_argument("--log-dir", default="logs",
                          help="Where per-run log files are written.")
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO",
+                         help="DEBUG shows per-shard packing detail and lane/task assignment from src.sharding.")
     parser.add_argument("--scored-at", default="2026-03-02T10:00:00Z", metavar="YYYY-MM-DDTHH:MM:SSZ",
                          help="Timestamp stamped on every output record's scored_at field (default: fixed, for reproducible runs).")
     args = parser.parse_args()
@@ -256,7 +258,7 @@ def main():
     if args.workers > 1 and args.backend != "local":
         parser.error("--workers > 1 is only meaningful for --backend local.")
 
-    log_path = configure_logging(pathlib.Path(args.log_dir))
+    log_path = configure_logging(pathlib.Path(args.log_dir), level=getattr(logging, args.log_level))
     logger.info("Logging to %s", log_path)
 
     if args.backend == "aws":
