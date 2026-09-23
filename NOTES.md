@@ -18,6 +18,7 @@
 | Uneven work | One task per conversation | Sharded, batched, interleaved dispatch (§6.1) |
 | Metrics | overall_sentiment, sentiment_trajectory | + `volatility` (§3), schema 1.2 |
 | Shard cleanup | N/A | Plan-scoped keys + S3 lifecycle expiry |
+| AWS drain | Fixed 60s cap could cut off a message mid-retry, dropping it silently | Idle+depth-zero exit; `--aws-drain-timeout` (900s) is now just a stuck-queue safety ceiling, plus a missing-conversation reconciliation warning |
 
 ---
 
@@ -314,11 +315,10 @@ Simplified: shows the unsharded path. A large conversation (§6.1) adds one hop 
 
 ## 9. Still open — next steps
 
-1. Continuous poll loop instead of the current bounded drain-and-exit.
-2. CloudWatch alarm on DLQ depth, wired to page someone.
-3. Re-run cost/benchmark scripts on the production CPU type.
-4. ONNX Runtime + INT8 quantisation — est. 2-4x, unmeasured.
-5. A human-labelled, real support-transcript set, for an accuracy number.
-6. Sarcasm / double-negation handling — still broken on both models tried.
-7. Retries with backoff on the local backend (AWS already gets this from SQS).
-8. Measure chunking's throughput cost on real, genuinely long transcripts.
+1. CloudWatch alarm on DLQ depth, wired to page someone.
+2. Re-run cost/benchmark scripts on the production CPU type.
+3. ONNX Runtime + INT8 quantisation — est. 2-4x, unmeasured.
+4. A human-labelled, real support-transcript set, for an accuracy number.
+5. Sarcasm / double-negation handling — still broken on both models tried.
+6. Retries with backoff on the local backend (AWS already gets this from SQS).
+7. Measure chunking's throughput cost on real, genuinely long transcripts.

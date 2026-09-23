@@ -86,7 +86,9 @@ def _run_one_worker_process(worker_index, total_workers, work_dir_str, output_di
 
 
 def _drain_queue(worker, queue, config, drain_timeout: float) -> dict:
-    """One AwsWorker's receive/process/ack loop until idle-with-empty-queue or `drain_timeout`s elapse."""
+    """One AwsWorker's receive/process/ack loop. Normal exit is idle-with-empty-queue (queue depth truly 0);
+    `drain_timeout` is only a safety ceiling for a genuinely stuck queue (e.g. broken infra), not the expected
+    stopping point - a message mid-redelivery must be allowed to finish its retry cycle, however long that takes."""
     summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0, "shards_scored": 0}
     idle_passes = 0
     deadline = time.monotonic() + drain_timeout
@@ -244,6 +246,7 @@ def run_aws(args):
     chunk_text_fn = functools.partial(chunk_text, count_tokens=count_tokens) if count_tokens else None  # enables chunk-level shards
 
     tasks = []  # (cost, tenant_id, conversation_id, shard or None)
+    expected_identities = set()  # every unique (tenant_id, conversation_id) enqueued; duplicates collapse naturally
     enqueued = 0
     for source_file in sorted(input_dir.glob("*.json")):
         raw_doc = json.loads(source_file.read_text(encoding="utf-8"))
@@ -252,6 +255,7 @@ def run_aws(args):
         if not tenant_id or not conversation_id:
             # No identity for an S3 key: upload under a synthetic key so it dead-letters through normal validation.
             tenant_id, conversation_id = "unknown", source_file.stem
+        expected_identities.add((tenant_id, conversation_id))
         conversations.put(tenant_id, conversation_id, raw_doc)
         shards, cost = plan_shards_and_cost(raw_doc, count_tokens=count_tokens, chunk_text_fn=chunk_text_fn)
         if shards:
@@ -312,6 +316,18 @@ def run_aws(args):
 
     dead_letters = dead_letter_worker.drain_dead_letters()
     combined = results_store.list_all()
+
+    accounted_for = {(r["tenant_id"], r["conversation_id"]) for r in combined}
+    for dl in dead_letters:
+        tenant_id, _, rest = dl["source_file"].partition("/")
+        accounted_for.add((tenant_id, rest.removesuffix(".json")))
+    missing = expected_identities - accounted_for
+    if missing:
+        logger.warning(
+            "%d conversation(s) neither scored nor dead-lettered - still in-flight when the run ended "
+            "(raise --aws-drain-timeout, or rerun to let their retry cycle finish): %s",
+            len(missing), sorted(missing))
+
     _write_run_output(output_dir, combined, dead_letters, summary)
 
 
@@ -333,8 +349,10 @@ def main():
                               "receive-batch/interleave lanes unless SENTIMENT_RECEIVE_BATCH is set.")
     parser.add_argument("--weighting", choices=WEIGHTING_CHOICES, default=DEFAULT_WEIGHTING,
                          help=f"How overall_sentiment averages per-turn scores (default: {DEFAULT_WEIGHTING}); see src/metrics.py.")
-    parser.add_argument("--aws-drain-timeout", type=float, default=60.0,
-                         help="[aws backend only] Max seconds to keep draining the queue before giving up.")
+    parser.add_argument("--aws-drain-timeout", type=float, default=900.0,
+                         help="[aws backend only] Safety ceiling (seconds): normal exit is the queue actually going "
+                              "idle and empty, however long that takes (e.g. a bad message's retry cycle before it "
+                              "reaches the DLQ). This only fires if something is genuinely stuck - keep it generous.")
     parser.add_argument("--log-dir", default="logs",
                          help="Where per-run log files are written.")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO",
@@ -351,10 +369,19 @@ def main():
     log_path = configure_logging(pathlib.Path(args.log_dir), level=getattr(logging, args.log_level))
     logger.info("Logging to %s", log_path)
 
+    run_start = datetime.now(timezone.utc)
+    start_monotonic = time.monotonic()
+
     if args.backend == "aws":
         run_aws(args)
     else:
         run_local(args)
+
+    elapsed_seconds = time.monotonic() - start_monotonic
+    run_end = datetime.now(timezone.utc)
+    logger.info("Run started at %s, finished at %s, total wall-clock time: %.2fs (%dm %.1fs)",
+                run_start.isoformat(), run_end.isoformat(), elapsed_seconds,
+                int(elapsed_seconds // 60), elapsed_seconds % 60)
 
 
 if __name__ == "__main__":
