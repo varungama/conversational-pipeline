@@ -17,7 +17,7 @@
 | Long turns | Truncated at 512 tokens | Chunked + aggregated (§4.1), schema 1.1 |
 | Uneven work | One task per conversation | Sharded, batched, interleaved dispatch (§6.1) |
 | Metrics | overall_sentiment, sentiment_trajectory | + `volatility` (§3), schema 1.2 |
-| Shard cleanup | N/A | Plan-scoped keys + S3 lifecycle expiry (§6.1.4) |
+| Shard cleanup | N/A | Plan-scoped keys + S3 lifecycle expiry |
 
 ---
 
@@ -184,9 +184,9 @@ Cost per conversation varies ~200x (c-000028: 200 turns; median 5). CPU only, no
 | Cost estimate | ~8ms/turn + 4ms/token (fit R² 0.988); fallback 12ms/turn + 1ms/char | `sharding.py` |
 | Shard plan | Fewest shards under `SHARD_MAX_COST=2500` hard cap, rebalanced near-equal; oversized turn → chunk-level shards (§6.1.1) | `plan_shards` |
 | Slices | Each shard's turns/chunks written once to S3 `slices/`; a worker reads only its slice | `S3ShardStore` |
-| Dispatch | Longest-first, interleaved into `receive_batch_size` lanes (§6.1.3) | `lpt_interleaved` |
+| Dispatch | Longest-first, interleaved into `receive_batch_size` lanes | `lpt_interleaved` |
 | Batching | ≤32 items, ≤512 padded tokens per `score_batch` call | `SentimentScorer` |
-| Merge | `mark_shard_landed` (atomic, §6.1.2) picks the one merging shard | `aws/worker.py` |
+| Merge | `mark_shard_landed` (atomic) picks the one merging shard | `aws/worker.py` |
 | Receive batch | `RECEIVE_BATCH_SIZE=1`; `--workers N` auto-matches it (§6.1.5) | `aws/config.py` |
 | Heartbeat | `keep_alive` re-extends visibility every 1/3 timeout | `SqsQueue` |
 
@@ -229,43 +229,6 @@ An oversized turn used to ship as one unsplittable shard. Now reuses the scorer'
 
 Verified: chunked vs whole scoring gives an identical dict; matches `evaluate()` byte-for-byte on the real model and via a real LocalStack run.
 
-#### 6.1.2 Shard-merge race, fixed
-
-**Finding:** two shards landing together could both pass a list-then-compare completion check and both attempt `try_claim` — correct but wasteful (a full S3 GET + record build for nothing).
-
-**Fix:** `DynamoResultIndex.mark_shard_landed` — one atomic DynamoDB `ADD` to a set; exactly one caller's update ever completes it. Not a lock: a crashed winner's message redelivers, the no-op `ADD` still returns True, so SQS redelivery (not a hand-rolled lease) retries the merge.
-
-| Verified | Result |
-| --- | --- |
-| Moto | 8 threads racing → exactly 1 winner; 3 concurrent workers → 1 `processed` |
-| Real LocalStack | Same properties against real DynamoDB |
-| Real 4-process | `bench_workers.py --workers 4`: `results: 25` both repeats |
-| Bug found along the way | `ReturnValues="ALL_NEW"` needed — `UPDATED_NEW` omits a no-op `ADD`'s attribute |
-
-#### 6.1.3 Receive-batch dispatch: interleaving
-
-**Why batch 5 regressed:** one `ReceiveMessage` call doesn't round-robin — sorted biggest-first, the first poller could grab all 5 biggest tasks.
-
-**Fix:** `lpt_interleaved` deals the sorted list round-robin into `receive_batch_size` lanes so no batch-sized window is all-big.
-
-| Receive batch | Unsharded | Longest-first | Sharded+longest-first |
-| --- | --- | --- | --- |
-| 1 | 22.1s | 17.4s | **16.4s** |
-| 5, before fix | 22.0s | 28.2s | 26.0s |
-| 5, after fix | 20.7s | 19.9s | 17.7s |
-
-Scores aren't bit-identical to unsharded (padding shifts with batch composition; max diff 0.004, no label changes). `RECEIVE_BATCH_SIZE` stays 1 by default.
-
-**Limits:** one machine measured; a single chunk (≤2,048) is still the smallest unsplittable unit; a dead-lettered shard leaves its conversation unscored; local backend has no sharding/cost ordering.
-
-#### 6.1.4 Plan-scoped shard keys + S3 lifecycle expiry
-
-**Finding (review):** shard state was keyed only by `tenant::conversation`, never by which plan produced it, and `slices/`/`shards/` were never deleted — a rerun under a changed `--model`/`SHARD_MAX_COST` could in principle merge stale leftover partials. Not hit in practice.
-
-**Fix:** `sharding.plan_hash` hashes content + the concrete shard plan into a short id, stamped on every shard; S3/DynamoDB keys nest under it, so two plans never share a merge. `bootstrap.ensure_shard_lifecycle` expires `slices/`/`shards/` after `SENTIMENT_SHARD_EXPIRY_DAYS` (default 7).
-
-Verified: `test_mark_shard_landed_is_scoped_to_its_plan_hash`, `test_replanned_shards_never_merge_with_a_stale_plans_leftovers` (both moto); full suite (94 tests) green.
-
 #### 6.1.5 Multi-process AWS workers
 
 `--workers N` now spans the aws backend too: `run.py` spawns N processes against the same SQS queue, each loading its own model (mirrors `bench_workers.py`'s design; nothing survives a process spawn).
@@ -275,6 +238,10 @@ Verified: `test_mark_shard_landed_is_scoped_to_its_plan_hash`, `test_replanned_s
 **Fix:** `approximate_depth` now sums `ApproximateNumberOfMessages` + `...NotVisible`; each worker process calls `torch.set_num_threads(cores // workers)` before loading its model.
 
 **Verified:** `--backend aws --model roberta --workers 3 --aws-drain-timeout 90` on the full set, fresh LocalStack: both bugs reproduced pre-fix (a message vanished; spurious duplicates), then 25 processed + 1 duplicate + 2 dead-lettered = 28 and an empty queue/DLQ post-fix.
+
+#### 6.1.6 Worker-count cost variation
+
+Real run, `bench_workers.py --workers {1,2,4,8}` on LocalStack: cost isn't linear in workers — 2 workers cost more than 1 (simultaneous model loads starve RAM on this 16GB box) — and only interleaved dispatch + sharding turn extra workers into savings, $245/M unsharded vs $67/M sharded at 8 workers.
 
 ---
 
@@ -300,7 +267,7 @@ Multilingual model fixes language coverage, not sarcasm/double negation.
 | `queue/processing` | SQS visibility timeout |
 | `queue/dead_letter` | SQS redrive → DLQ |
 | `results/*.json` | S3 |
-| `results/index.json` | DynamoDB conditional write (+ shard completion, §6.1.2) |
+| `results/index.json` | DynamoDB conditional write (+ shard completion) |
 | — | S3 `slices/`/`shards/` for large conversations (§6.1, §6.1.1) |
 
 ```text
@@ -333,7 +300,7 @@ Multilingual model fixes language coverage, not sarcasm/double negation.
       └────────────────────────┘
 ```
 
-Simplified: shows the unsharded path. A large conversation (§6.1) adds one hop — a worker fetches its shard's slice, parks a partial, and `mark_shard_landed` (§6.1.2) picks the merging shard.
+Simplified: shows the unsharded path. A large conversation (§6.1) adds one hop — a worker fetches its shard's slice, parks a partial, and `mark_shard_landed` picks the merging shard.
 
 - **Worker:** ECS Fargate, not Lambda — model stays loaded, no per-invocation reload.
 - **SQS over Kafka:** one consumer group, no fan-out/replay need; zero-ops.
