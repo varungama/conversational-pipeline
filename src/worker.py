@@ -40,6 +40,7 @@ class Worker:
         try:
             raw_doc = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
+            logger.error("Could not read %s as JSON: %s", path.name, exc)
             self.queue.mark_dead(path, f"unreadable_json: {exc}")
             return "dead_lettered"
 

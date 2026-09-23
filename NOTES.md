@@ -44,8 +44,8 @@ Flags (all recorded in each output's `model` block):
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--model {roberta,distilbert}` | roberta | |
-| `--workers N` | 1 | local backend only |
-| `--weighting {equal,confidence}` | equal | |
+| `--workers N` | 1 | local or aws (§6.1.5); on aws also sizes the receive-batch/interleave lanes |
+| `--weighting {equal,confidence}` | confidence | |
 | `--backend {local,aws}` | local | |
 | `--scored-at <ISO8601>` | fixed | byte-identical reruns |
 
@@ -187,7 +187,7 @@ Cost per conversation varies ~200x (c-000028: 200 turns; median 5). CPU only, no
 | Dispatch | Longest-first, interleaved into `receive_batch_size` lanes (§6.1.3) | `lpt_interleaved` |
 | Batching | ≤32 items, ≤512 padded tokens per `score_batch` call | `SentimentScorer` |
 | Merge | `mark_shard_landed` (atomic, §6.1.2) picks the one merging shard | `aws/worker.py` |
-| Receive batch | `RECEIVE_BATCH_SIZE=1` — a bigger batch would hoard big tasks | `aws/config.py` |
+| Receive batch | `RECEIVE_BATCH_SIZE=1`; `--workers N` auto-matches it (§6.1.5) | `aws/config.py` |
 | Heartbeat | `keep_alive` re-extends visibility every 1/3 timeout | `SqsQueue` |
 
 Env overrides: `SENTIMENT_VISIBILITY_TIMEOUT`, `SENTIMENT_RECEIVE_BATCH`, `SENTIMENT_WORST_TASK_SECONDS`.
@@ -265,6 +265,16 @@ Scores aren't bit-identical to unsharded (padding shifts with batch composition;
 **Fix:** `sharding.plan_hash` hashes content + the concrete shard plan into a short id, stamped on every shard; S3/DynamoDB keys nest under it, so two plans never share a merge. `bootstrap.ensure_shard_lifecycle` expires `slices/`/`shards/` after `SENTIMENT_SHARD_EXPIRY_DAYS` (default 7).
 
 Verified: `test_mark_shard_landed_is_scoped_to_its_plan_hash`, `test_replanned_shards_never_merge_with_a_stale_plans_leftovers` (both moto); full suite (94 tests) green.
+
+#### 6.1.5 Multi-process AWS workers
+
+`--workers N` now spans the aws backend too: `run.py` spawns N processes against the same SQS queue, each loading its own model (mirrors `bench_workers.py`'s design; nothing survives a process spawn).
+
+**Finding:** two bugs surfaced running the full 28-conversation set with real `--workers 3`. `approximate_depth()` counted only visible messages, so a message mid-redelivery-wait looked like an empty queue — the idle-exit could shut every worker down before SQS redrove it, silently dropping it from both `results.json` and `errors.json`. Separately, no process capped its torch thread pool, so 3 processes fought over every core, slowing inference enough to trigger spurious "duplicate delivery" redeliveries too.
+
+**Fix:** `approximate_depth` now sums `ApproximateNumberOfMessages` + `...NotVisible`; each worker process calls `torch.set_num_threads(cores // workers)` before loading its model.
+
+**Verified:** `--backend aws --model roberta --workers 3 --aws-drain-timeout 90` on the full set, fresh LocalStack: both bugs reproduced pre-fix (a message vanished; spurious duplicates), then 25 processed + 1 duplicate + 2 dead-lettered = 28 and an empty queue/DLQ post-fix.
 
 ---
 

@@ -5,6 +5,7 @@ import functools
 import json
 import logging
 import multiprocessing as mp
+import os
 import pathlib
 import time
 from datetime import datetime, timezone
@@ -33,10 +34,12 @@ def _write_run_output(output_dir: pathlib.Path, combined: list, dead_letters: li
 
 
 def configure_logging(log_dir: pathlib.Path, suffix: str = "", level: int = logging.INFO) -> pathlib.Path:
-    """Logs to the console and a timestamped file in log_dir; `suffix` keeps concurrent worker processes off one file."""
-    log_dir.mkdir(parents=True, exist_ok=True)
-    started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = log_dir / f"pipeline_{started_at}{suffix}.log"
+    """Logs to the console and logs/YYYY/MM/DD/<worker>/pipeline_<timestamp>.log; `suffix` names concurrent workers."""
+    now = datetime.now(timezone.utc)
+    worker_name = suffix[1:] if suffix else "main"  # suffix is "" (coordinator) or "_workerN"
+    run_dir = log_dir / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d") / worker_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / f"pipeline_{now.strftime('%Y%m%dT%H%M%SZ')}.log"
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -54,11 +57,21 @@ def configure_logging(log_dir: pathlib.Path, suffix: str = "", level: int = logg
     return log_path
 
 
-def _run_one_worker_process(worker_index, work_dir_str, output_dir_str, scored_at, model_key,
+def _limit_torch_threads(total_workers: int):
+    """Caps this process's torch thread pool to its fair share, else N processes oversubscribe the CPU and stall."""
+    try:
+        import torch
+        torch.set_num_threads(max(1, (os.cpu_count() or 1) // total_workers))
+    except ImportError:
+        pass
+
+
+def _run_one_worker_process(worker_index, total_workers, work_dir_str, output_dir_str, scored_at, model_key,
                              weighting, log_dir_str, result_conn):
     """Child-process entry for `--workers`; module-level because Windows "spawn" pickles the target by reference."""
     configure_logging(pathlib.Path(log_dir_str), suffix=f"_worker{worker_index}")
     try:
+        _limit_torch_threads(total_workers)
         queue = FileQueue(pathlib.Path(work_dir_str))
         logger.info("[worker %d] Loading sentiment model %s...", worker_index, model_key)
         scorer = SentimentScorer(model_key=model_key)
@@ -66,6 +79,61 @@ def _run_one_worker_process(worker_index, work_dir_str, output_dir_str, scored_a
                     scorer.backend_name, scorer.model_name, scorer.model_revision)
         worker = Worker(queue, pathlib.Path(output_dir_str), scorer, scored_at=scored_at, weighting=weighting)
         summary = worker.run_once()
+        logger.info("[worker %d] Done: %s", worker_index, json.dumps(summary))
+        result_conn.send(summary)
+    finally:
+        result_conn.close()
+
+
+def _drain_queue(worker, queue, config, drain_timeout: float) -> dict:
+    """One AwsWorker's receive/process/ack loop until idle-with-empty-queue or `drain_timeout`s elapse."""
+    summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0, "shards_scored": 0}
+    idle_passes = 0
+    deadline = time.monotonic() + drain_timeout
+    while time.monotonic() < deadline:
+        batch = worker.run_once(max_messages=config.receive_batch_size)
+        summary["shards_scored"] += batch["shards_scored"]
+        summary["processed"] += batch["processed"]
+        summary["skipped_duplicate"] += batch["skipped_duplicate"]
+        summary["retry_attempts"] += batch["left_for_retry"]
+        if sum(batch.values()) == 0:
+            idle_passes += 1
+            if idle_passes >= 3 and queue.approximate_depth() == 0:
+                break
+            time.sleep(config.visibility_timeout_seconds / 2 + 0.5)
+        else:
+            idle_passes = 0
+    return summary
+
+
+def _run_one_aws_worker_process(worker_index, total_workers, config, infra, drain_timeout, model_key,
+                                 weighting, scored_at, log_dir_str, result_conn):
+    """Child-process entry for AWS `--workers`; module-level because Windows "spawn" pickles the target by reference.
+    Builds its own boto3 clients/model (neither survives a spawn) against the infra the parent already created."""
+    from src.aws.clients import AwsClients
+    from src.aws.dynamo_ledger import DynamoResultIndex
+    from src.aws.s3_store import S3ConversationStore, S3ResultStore, S3ShardStore
+    from src.aws.sqs_queue import SqsQueue
+    from src.aws.worker import AwsWorker
+
+    configure_logging(pathlib.Path(log_dir_str), suffix=f"_worker{worker_index}")
+    try:
+        _limit_torch_threads(total_workers)
+        clients = AwsClients(config)
+        queue = SqsQueue(clients, infra["queue_url"], infra["dlq_url"], config.visibility_timeout_seconds)
+        conversations = S3ConversationStore(clients, config.conversations_bucket)
+        results_store = S3ResultStore(clients, config.results_bucket)
+        ledger = DynamoResultIndex(clients, config.ledger_table_name)
+        shard_store = S3ShardStore(clients, config.conversations_bucket)
+
+        logger.info("[worker %d] Loading sentiment model %s...", worker_index, model_key)
+        scorer = SentimentScorer(model_key=model_key)
+        logger.info("[worker %d] Using scoring backend: %s (%s @ %s)", worker_index,
+                    scorer.backend_name, scorer.model_name, scorer.model_revision)
+
+        worker = AwsWorker(queue, conversations, results_store, ledger, scorer,
+                            scored_at=scored_at, weighting=weighting, shard_store=shard_store)
+        summary = _drain_queue(worker, queue, config, drain_timeout)
         logger.info("[worker %d] Done: %s", worker_index, json.dumps(summary))
         result_conn.send(summary)
     finally:
@@ -103,7 +171,7 @@ def run_local(args):
             parent_conn, child_conn = mp.Pipe(duplex=False)
             process = mp.Process(
                 target=_run_one_worker_process,
-                args=(worker_index, str(work_dir), str(output_dir), args.scored_at, args.model,
+                args=(worker_index, args.workers, str(work_dir), str(output_dir), args.scored_at, args.model,
                       args.weighting, args.log_dir, child_conn),
             )
             process.start()
@@ -118,7 +186,8 @@ def run_local(args):
             process.join()
             for key, count in worker_summary.items():
                 summary[key] = summary.get(key, 0) + count
-            logger.info("worker %d exited with code %s", worker_index, process.exitcode)
+            log = logger.info if process.exitcode == 0 else logger.warning
+            log("worker %d exited with code %s", worker_index, process.exitcode)
 
     combined = []
     for result_file in sorted(output_dir.glob("*.json")):
@@ -151,6 +220,12 @@ def run_aws(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     config = AwsConfig()
+    if args.workers > 1 and "SENTIMENT_RECEIVE_BATCH" not in os.environ:
+        # Interleave lanes only pay off with multiple concurrent receivers (NOTES.md 6.1.3);
+        # match them to --workers unless the user pinned the batch size explicitly via the env var.
+        config = AwsConfig(receive_batch_size=args.workers)
+        logger.info("Matching receive-batch/interleave lanes to --workers=%d (override with SENTIMENT_RECEIVE_BATCH)",
+                    args.workers)
     logger.info("Connecting to %s (%s)...", config.endpoint_url or "real AWS", config.region)
     clients = AwsClients(config)
     infra = ensure_infrastructure(clients, config)
@@ -192,35 +267,50 @@ def run_aws(args):
         queue.enqueue(tenant_id, conversation_id, shard=shard)
     logger.info("Enqueued %d conversation file(s) from %s as %d task(s)", enqueued, input_dir, len(tasks))
 
-    logger.info("Loading sentiment model %s (downloads on first run if not already cached)...", args.model)
-    scorer = SentimentScorer(model_key=args.model)
-    logger.info("Using scoring backend: %s (%s @ %s)",
-                scorer.backend_name, scorer.model_name, scorer.model_revision)
-
-    worker = AwsWorker(queue, conversations, results_store, ledger, scorer, scored_at=args.scored_at,
-                        weighting=args.weighting, shard_store=shard_store)
-
     logger.info("Visibility timeout %ds for receive batches of %d (worst-case task %.0fs)",
                 config.visibility_timeout_seconds, config.receive_batch_size, config.worst_case_task_seconds)
-    summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0, "shards_scored": 0}
 
-    idle_passes = 0
-    deadline = time.monotonic() + args.aws_drain_timeout
-    while time.monotonic() < deadline:
-        batch = worker.run_once(max_messages=config.receive_batch_size)
-        summary["shards_scored"] += batch["shards_scored"]
-        summary["processed"] += batch["processed"]
-        summary["skipped_duplicate"] += batch["skipped_duplicate"]
-        summary["retry_attempts"] += batch["left_for_retry"]
-        if sum(batch.values()) == 0:
-            idle_passes += 1
-            if idle_passes >= 3 and queue.approximate_depth() == 0:
-                break
-            time.sleep(config.visibility_timeout_seconds / 2 + 0.5)
-        else:
-            idle_passes = 0
+    if args.workers <= 1:
+        logger.info("Loading sentiment model %s (downloads on first run if not already cached)...", args.model)
+        scorer = SentimentScorer(model_key=args.model)
+        logger.info("Using scoring backend: %s (%s @ %s)",
+                    scorer.backend_name, scorer.model_name, scorer.model_revision)
 
-    dead_letters = worker.drain_dead_letters()
+        worker = AwsWorker(queue, conversations, results_store, ledger, scorer, scored_at=args.scored_at,
+                            weighting=args.weighting, shard_store=shard_store)
+        summary = _drain_queue(worker, queue, config, args.aws_drain_timeout)
+        dead_letter_worker = worker
+    else:
+        logger.info("Starting %d worker processes against queue %s (model=%s, weighting=%s)",
+                     args.workers, config.queue_name, args.model, args.weighting)
+        processes = []
+        parent_conns = []
+        for worker_index in range(args.workers):
+            parent_conn, child_conn = mp.Pipe(duplex=False)
+            process = mp.Process(
+                target=_run_one_aws_worker_process,
+                args=(worker_index, args.workers, config, infra, args.aws_drain_timeout, args.model,
+                      args.weighting, args.scored_at, args.log_dir, child_conn),
+            )
+            process.start()
+            child_conn.close()  # the child's copy is enough; close the parent's duplicate
+            processes.append(process)
+            parent_conns.append(parent_conn)
+
+        summary = {"processed": 0, "skipped_duplicate": 0, "retry_attempts": 0, "shards_scored": 0}
+        for worker_index, (process, conn) in enumerate(zip(processes, parent_conns)):
+            worker_summary = conn.recv()
+            conn.close()
+            process.join()
+            for key, count in worker_summary.items():
+                summary[key] = summary.get(key, 0) + count
+            log = logger.info if process.exitcode == 0 else logger.warning
+            log("worker %d exited with code %s", worker_index, process.exitcode)
+
+        # drain_dead_letters only touches self.queue; skip loading a model just for this.
+        dead_letter_worker = AwsWorker(queue, conversations, results_store, ledger, None, shard_store=shard_store)
+
+    dead_letters = dead_letter_worker.drain_dead_letters()
     combined = results_store.list_all()
     _write_run_output(output_dir, combined, dead_letters, summary)
 
@@ -238,7 +328,9 @@ def main():
     parser.add_argument("--model", choices=sorted(MODEL_REGISTRY), default=DEFAULT_MODEL_KEY,
                          help=f"Transformer backend to score turns with (default: {DEFAULT_MODEL_KEY}); see src/sentiment_model.py's MODEL_REGISTRY.")
     parser.add_argument("--workers", type=int, default=1,
-                         help="[local backend only] Number of worker processes to run against the same --work-dir.")
+                         help="Number of worker processes to run concurrently against the same --work-dir "
+                              "(local backend) or the same SQS queue (aws backend); on aws, also sizes the "
+                              "receive-batch/interleave lanes unless SENTIMENT_RECEIVE_BATCH is set.")
     parser.add_argument("--weighting", choices=WEIGHTING_CHOICES, default=DEFAULT_WEIGHTING,
                          help=f"How overall_sentiment averages per-turn scores (default: {DEFAULT_WEIGHTING}); see src/metrics.py.")
     parser.add_argument("--aws-drain-timeout", type=float, default=60.0,
@@ -255,8 +347,6 @@ def main():
         parser.error(f"--scored-at must look like 2026-03-02T10:00:00Z, got {args.scored_at!r}")
     if args.workers < 1:
         parser.error(f"--workers must be at least 1, got {args.workers}")
-    if args.workers > 1 and args.backend != "local":
-        parser.error("--workers > 1 is only meaningful for --backend local.")
 
     log_path = configure_logging(pathlib.Path(args.log_dir), level=getattr(logging, args.log_level))
     logger.info("Logging to %s", log_path)

@@ -88,7 +88,9 @@ class SqsQueue:
         self.sqs.delete_message(QueueUrl=self.dlq_url, ReceiptHandle=message.receipt_handle)
 
     def approximate_depth(self) -> int:
+        """Visible + in-flight messages; a redelivery-wait must count too or an idle-exit can abandon it mid-retry."""
         attrs = self.sqs.get_queue_attributes(
-            QueueUrl=self.queue_url, AttributeNames=["ApproximateNumberOfMessages"]
-        )
-        return int(attrs["Attributes"]["ApproximateNumberOfMessages"])
+            QueueUrl=self.queue_url,
+            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+        )["Attributes"]
+        return int(attrs["ApproximateNumberOfMessages"]) + int(attrs["ApproximateNumberOfMessagesNotVisible"])

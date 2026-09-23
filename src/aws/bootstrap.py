@@ -23,6 +23,7 @@ def ensure_bucket(clients: AwsClients, name: str):
         logger.info("Created S3 bucket %s", name)
     except ClientError as exc:
         _ignore_already_exists(exc, "BucketAlreadyOwnedByYou", "BucketAlreadyExists")
+        logger.debug("S3 bucket %s already exists", name)
 
 
 def ensure_shard_lifecycle(clients: AwsClients, bucket: str, expiry_days: int):
@@ -52,6 +53,7 @@ def ensure_queue(clients: AwsClients, name: str, attributes: dict | None = None)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "QueueAlreadyExists":
             raise
+        logger.debug("SQS queue %s already exists", name)
         return clients.sqs.get_queue_url(QueueName=name)["QueueUrl"]
 
 
@@ -66,6 +68,7 @@ def ensure_ledger_table(clients: AwsClients, table_name: str):
         logger.info("Created DynamoDB table %s", table_name)
     except ClientError as exc:
         _ignore_already_exists(exc, "ResourceInUseException")
+        logger.debug("DynamoDB table %s already exists", table_name)
 
     waiter = clients.dynamodb.get_waiter("table_exists")
     waiter.wait(TableName=table_name, WaiterConfig={"Delay": 1, "MaxAttempts": 30})

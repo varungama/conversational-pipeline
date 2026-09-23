@@ -20,7 +20,7 @@ def trend_label(delta, neutral_threshold=NEUTRAL_THRESHOLD):
 
 
 WEIGHTING_CHOICES = ("equal", "confidence")
-DEFAULT_WEIGHTING = "equal"
+DEFAULT_WEIGHTING = "confidence"
 
 
 def compute_overall_sentiment(customer_scores, neutral_threshold=NEUTRAL_THRESHOLD, weighting=DEFAULT_WEIGHTING):

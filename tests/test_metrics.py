@@ -14,7 +14,7 @@ class TestOverallSentiment(unittest.TestCase):
         self.assertEqual(result["n_turns"], 1)
 
     def test_plain_mean_of_several_turns(self):
-        result = compute_overall_sentiment([(0.8, 0.9), (-0.4, 0.6), (0.0, 0.1)])
+        result = compute_overall_sentiment([(0.8, 0.9), (-0.4, 0.6), (0.0, 0.1)], weighting="equal")
         self.assertAlmostEqual(result["score"], (0.8 - 0.4 + 0.0) / 3, places=4)
         self.assertEqual(result["n_turns"], 3)
 
