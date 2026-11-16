@@ -65,7 +65,7 @@ def compute_sentiment_trajectory(ordered_customer_scores, neutral_threshold=NEUT
     }
 
 
-VOLATILITY_THRESHOLD = 0.3  # mean abs consecutive change above this = "chaotic"; wider than NEUTRAL_THRESHOLD since a diff of two scores carries more noise
+VOLATILITY_THRESHOLD = 0.5  # mean abs consecutive change above this = "chaotic"; wider than NEUTRAL_THRESHOLD since a diff of two scores carries more noise
 
 
 def volatility_label(level_label: str, volatility: float, volatility_threshold=VOLATILITY_THRESHOLD) -> str:

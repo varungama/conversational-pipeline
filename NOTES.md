@@ -82,7 +82,7 @@ Computed over customer turns with real content only (empty/whitespace excluded).
 
 - Confidence-weighting pulls toward what the model was sure about: `c-000022` -0.14→-0.08, `c-000007` -0.74→-0.84.
 - Label bands: `overall_sentiment`/`volatility` level `>0.2` positive, `<-0.2` negative, else neutral/flat.
-- `volatility` crosses stability (`stable`/`chaotic`, threshold 0.3 — wider than 0.2 since a *diff* of two scores carries more noise) with level (from the *mean* score) → 6 labels. Tells a whiplash conversation (`+0.9,-0.9,+0.9,-0.9,+0.9`, trajectory="flat") apart from one that's actually flat throughout.
+- `volatility` crosses stability (`stable`/`chaotic`, threshold 0.5, raised from 0.3 — wider than 0.2 since a *diff* of two scores carries more noise; fewer conversations now label `chaotic`, so previously-scored results near the old cutoff may relabel on rerun) with level (from the *mean* score) → 6 labels. Tells a whiplash conversation (`+0.9,-0.9,+0.9,-0.9,+0.9`, trajectory="flat") apart from one that's actually flat throughout.
 - Ordering: sorted by parsed `ts`, not `seq` (`seq` can be wrong).
 - Reproducibility: `--scored-at` fixed (byte-identical reruns); `input_sha256` flags content drift.
 
